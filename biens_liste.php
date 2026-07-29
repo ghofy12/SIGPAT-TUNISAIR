@@ -1,12 +1,18 @@
 <?php
 require_once 'config.php';
 if(!isLoggedIn()){ redirect('login.php'); }
+requireModuleAccess($pdo, 'biens_fonciers');
 $username = $_SESSION['username'] ?? 'Utilisateur';
+
+$canCreate = hasModulePermission($pdo, 'biens_fonciers', 'create');
+$canUpdate = hasModulePermission($pdo, 'biens_fonciers', 'update');
+$canDelete = hasModulePermission($pdo, 'biens_fonciers', 'delete');
 
 $zone = $_GET['zone'] ?? 'Tunisie';
 
 // ── ADD ──
 if(isset($_POST['action']) && $_POST['action']==='add'){
+    requireModulePermission($pdo, 'biens_fonciers', 'create');
     $fields=['adresse','reference','superficie','statut','valeur_acquisition','date_acquisition',
              'type_bien','num_contrat','type_contrat','date_contrat','date_debut_contrat',
              'date_fin_contrat','duree_contrat','loyer_mensuel','locataire','notaire','caution','map_url'];
@@ -31,6 +37,7 @@ if(isset($_POST['action']) && $_POST['action']==='add'){
 
 // ── DELETE ──
 if(isset($_POST['action']) && $_POST['action']==='delete' && !empty($_POST['id'])){
+    requireModulePermission($pdo, 'biens_fonciers', 'delete');
     $pdo->prepare("DELETE FROM biens_fonciers WHERE id=?")->execute([$_POST['id']]);
     header("Location: ?zone=".urlencode($zone)); exit;
 }
@@ -47,6 +54,7 @@ $PDF_FIELDS = [
 
 // ── EDIT ──
 if(isset($_POST['action']) && $_POST['action']==='edit' && !empty($_POST['id'])){
+    requireModulePermission($pdo, 'biens_fonciers', 'update');
     $fields=['adresse','reference','superficie','statut','valeur_acquisition','date_acquisition',
              'type_bien','num_contrat','type_contrat','date_contrat','date_debut_contrat',
              'date_fin_contrat','duree_contrat','loyer_mensuel','locataire','notaire','caution','map_url'];
@@ -67,6 +75,7 @@ if(isset($_POST['action']) && $_POST['action']==='edit' && !empty($_POST['id']))
 
 // ── UPLOAD ──
 if(isset($_POST['action']) && $_POST['action']==='upload' && !empty($_POST['id'])){
+    requireModulePermission($pdo, 'biens_fonciers', 'update');
     foreach($PDF_FIELDS as $pf){
         if(!empty($_FILES[$pf]['tmp_name'])){
             $dir='documents/'; if(!is_dir($dir)) mkdir($dir,0755,true);
@@ -76,6 +85,32 @@ if(isset($_POST['action']) && $_POST['action']==='upload' && !empty($_POST['id']
         }
     }
     header("Location: ?zone=".urlencode($zone)."&id=".$_POST['id']); exit;
+}
+
+// ── ADD EXPERTISE ──
+if(isset($_POST['action']) && $_POST['action']==='add_expertise' && !empty($_POST['id'])){
+    requireModulePermission($pdo, 'biens_fonciers', 'create');
+    $annee  = (int)($_POST['annee']??date('Y'));
+    $type   = in_array($_POST['type']??'',['locative','venale']) ? $_POST['type'] : 'venale';
+    $valeur = (float)($_POST['valeur']??0);
+    $pdfPath= null;
+    if(!empty($_FILES['rapport_pdf']['tmp_name']) && $_FILES['rapport_pdf']['error']===UPLOAD_ERR_OK){
+        $dir='documents/'; if(!is_dir($dir)) mkdir($dir,0755,true);
+        $fname='expertise_'.$type.'_'.$_POST['id'].'_'.$annee.'_'.time().'.pdf';
+        move_uploaded_file($_FILES['rapport_pdf']['tmp_name'],$dir.$fname);
+        $pdfPath=$dir.$fname;
+    }
+    $pdo->prepare("INSERT INTO bien_expertises (bien_id,type,annee,valeur,rapport_pdf) VALUES (?,?,?,?,?)")
+        ->execute([$_POST['id'],$type,$annee,$valeur,$pdfPath]);
+    header("Location: ?zone=".urlencode($zone)."&id=".$_POST['id']); exit;
+}
+
+// ── DELETE EXPERTISE ──
+if(isset($_POST['action']) && $_POST['action']==='delete_expertise' && !empty($_POST['expertise_id'])){
+    requireModulePermission($pdo, 'biens_fonciers', 'delete');
+    $bid=$_POST['bien_id']??null;
+    $pdo->prepare("DELETE FROM bien_expertises WHERE id=?")->execute([$_POST['expertise_id']]);
+    header("Location: ?zone=".urlencode($zone).($bid?"&id=$bid":'')); exit;
 }
 
 // ── FETCH ──
@@ -94,6 +129,11 @@ if(isset($_GET['id'])){
     $s->execute([$_GET['id']]); $bien=$s->fetch();
 }
 
+$expertises=[];
+if(isset($_GET['id'])){
+    $se=$pdo->prepare("SELECT * FROM bien_expertises WHERE bien_id=? ORDER BY annee DESC, type ASC");
+    $se->execute([$_GET['id']]); $expertises=$se->fetchAll();
+}
 $isTN = $zone === 'Tunisie';
 ?>
 <!DOCTYPE html>
@@ -372,6 +412,36 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
 .pdf-upload-label:hover{opacity:.88;transform:translateY(-1px);}
 .pdf-upload-label.replace{background:var(--bg);color:var(--ink);border:1.5px solid var(--rule);}
 .pdf-upload-label.replace:hover{background:#E5E7EB;}
+
+/* ══ EXPERTISE PAR ANNÉE ══ */
+.exp-years-list{display:flex;flex-direction:column;}
+.exp-year-block{border-bottom:1px solid var(--rule);}
+.exp-year-block:last-child{border-bottom:none;}
+.exp-year-hd{
+  display:flex;align-items:center;
+  padding:12px 20px 8px;
+  background:var(--bg);
+  border-bottom:1px solid var(--rule);
+}
+.exp-year-badge{
+  display:inline-block;background:var(--accent);color:white;
+  border-radius:6px;padding:3px 11px;font-size:12px;font-weight:700;letter-spacing:.03em;
+}
+.exp-doc-row{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:11px 20px;gap:12px;flex-wrap:wrap;
+  border-bottom:1px dashed var(--rule);
+}
+.exp-doc-row:last-child{border-bottom:none;}
+.exp-type-badge{
+  flex-shrink:0;display:inline-block;
+  padding:3px 10px;border-radius:5px;font-size:11px;font-weight:600;letter-spacing:.03em;
+}
+.exp-type-badge.locative{background:#DBEAFE;color:#1D4ED8;}
+.exp-type-badge.venale{background:<?=$isTN?'rgba(200,16,46,.1)':'rgba(29,78,216,.1)'?>;color:var(--accent);}
+.exp-filename{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px;}
+.exp-type-badge{transition:opacity .15s,transform .15s;}
+.exp-type-badge:hover{opacity:.82;transform:translateX(2px);}
 </style>
 </head>
 <body>
@@ -399,12 +469,14 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
     </svg>
     Retour aux biens fonciers
   </a>
+  <?php if($canCreate): ?>
   <button class="btn-ajouter" onclick="document.getElementById('addModal').classList.add('open')">
     <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
       <path d="M8 2v12M2 8h12" stroke="white" stroke-width="2" stroke-linecap="round"/>
     </svg>
     Ajouter un bien
   </button>
+  <?php endif; ?>
   <div class="sidebar-divider"></div>
   <p class="sidebar-hd">Portefeuille (<?=$total?>)</p>
   <?php foreach($biens as $i=>$b): ?>
@@ -442,14 +514,18 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
   <h1 class="detail-title"><?=htmlspecialchars($bien['adresse'])?></h1>
   <span class="detail-zone"><?=$isTN?'🇹🇳':'🌍'?> <?=htmlspecialchars($zone)?></span>
   <div class="detail-actions">
+    <?php if($canUpdate): ?>
     <button class="btn btn-ghost" onclick="document.getElementById('editModal').classList.add('open')">
       <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M11.5 2.5a1.414 1.414 0 0 1 2 2L5 13H3v-2L11.5 2.5z" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
       Modifier
     </button>
+    <?php endif; ?>
+    <?php if($canDelete): ?>
     <button class="btn btn-danger" onclick="document.getElementById('deleteModal').classList.add('open')">
       <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M2 4h12M5 4V3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1M6 7v5M10 7v5M3 4l1 9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1l1-9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
       Supprimer
     </button>
+    <?php endif; ?>
   </div>
 </div>
 
@@ -521,64 +597,100 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
     </div>
     <?php endforeach; ?>
 
-    <!-- ── Rapport d'Expertise — carte groupée ── -->
+    <!-- ── Rapports d'Expertise — PDFs par année ── -->
     <?php
-    $rapportSubs = [
-      'rapport_valeur_locative_pdf' => 'Valeur Locative',
-      'rapport_valeur_venale_pdf'   => 'Valeur Vénale',
-    ];
-    // FIX : compteur corrigé (2 sous-docs, plus "/ 3")
-    $rapportCount = count(array_filter(array_keys($rapportSubs), fn($col) => !empty($bien[$col])));
-    $rapportTotal = count($rapportSubs);
+    // Grouper par année
+    $expParAnnee = [];
+    foreach($expertises as $e){
+        $expParAnnee[$e['annee']][$e['type']] = $e;
+    }
+    krsort($expParAnnee); // années décroissantes
     ?>
-    <div class="rapport-card">
-      <div class="rapport-header">
-        <div class="doc-icon">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><polyline points="14 2 14 8 20 8" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </div>
-        <div class="rapport-header-text">
-          <div class="doc-name">Rapport d'Expertise</div>
-          <div class="doc-sub"><?=$rapportCount?> / <?=$rapportTotal?> document<?=$rapportCount>1?'s':''?> uploadé<?=$rapportCount>1?'s':''?></div>
-        </div>
-      </div>
-      <div class="rapport-rows">
-        <?php foreach($rapportSubs as $col=>$label):
-          $path=$bien[$col]??null;
-        ?>
-        <div class="rapport-row">
-          <div class="rapport-row-info">
-            <div class="rapport-row-icon">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" stroke="white" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><polyline points="14 2 14 8 20 8" stroke="white" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </div>
-            <div>
-              <div class="rapport-row-label"><?=htmlspecialchars($label)?></div>
-              <div class="rapport-row-file"><?=$path?basename($path):'Aucun document'?></div>
-            </div>
+    <div class="rapport-card" style="grid-column:1/-1;">
+      <div class="rapport-header" style="justify-content:space-between;flex-wrap:wrap;gap:10px;">
+        <div style="display:flex;align-items:center;gap:12px;">
+          <div class="doc-icon">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><polyline points="14 2 14 8 20 8" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </div>
-          <div class="rapport-row-actions">
-            <?php if($path): ?>
-              <button class="doc-btn" onclick="openPDF('<?=htmlspecialchars($path)?>', 'Rapport — <?=htmlspecialchars($label)?>')">
-                <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M1 8s3-5 7-5 7 5 7 5-3 5-7 5-7-5-7-5z" stroke="currentColor" stroke-width="1.4"/><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.4"/></svg>
-                Aperçu
-              </button>
-              <a class="doc-btn" href="<?=htmlspecialchars($path)?>" download>
-                <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 2v8M5 7l3 3 3-3M3 13h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                Télécharger
-              </a>
-            <?php endif; ?>
-            <form method="post" enctype="multipart/form-data" style="display:inline">
-              <input type="hidden" name="action" value="upload">
-              <input type="hidden" name="id" value="<?=$bien['id']?>">
-              <input type="file" name="<?=$col?>" accept=".pdf" class="upload-input" id="up_<?=$col?>" onchange="this.form.submit()">
-              <label for="up_<?=$col?>" class="doc-btn doc-btn-upload" style="cursor:pointer;">
-                <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 12V4M5 7l3-3 3 3M3 13h10" stroke="white" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                <?=$path?'Remplacer':'Uploader'?>
-              </label>
-            </form>
+          <div class="rapport-header-text">
+            <div class="doc-name">Rapports d'Expertise</div>
+            <div class="doc-sub"><?=count($expParAnnee)?> année<?=count($expParAnnee)>1?'s':''?> — <?=count($expertises)?> document<?=count($expertises)>1?'s':''?></div>
           </div>
         </div>
-        <?php endforeach; ?>
+        <?php if($canCreate): ?>
+        <button class="doc-btn doc-btn-upload" onclick="document.getElementById('addExpertiseModal').classList.add('open')" style="gap:6px;">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 2v12M2 8h12" stroke="white" stroke-width="2" stroke-linecap="round"/></svg>
+          Ajouter
+        </button>
+        <?php endif; ?>
       </div>
+
+      <?php if(empty($expParAnnee)): ?>
+        <div style="padding:36px;text-align:center;color:var(--muted);font-size:13px;">
+          <svg width="36" height="36" viewBox="0 0 24 24" fill="none" style="margin-bottom:10px;opacity:.35;display:block;margin-inline:auto;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><polyline points="14 2 14 8 20 8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Aucun rapport d'expertise.<br>Cliquez sur <strong>Ajouter</strong> pour uploader un PDF.
+        </div>
+      <?php else: ?>
+        <div class="exp-years-list">
+          <?php foreach($expParAnnee as $annee => $docs): ?>
+          <div class="exp-year-block">
+
+            <!-- Entête année -->
+            <div class="exp-year-hd">
+              <span class="exp-year-badge"><?=$annee?></span>
+              <span style="font-size:11px;color:var(--muted);margin-left:10px;">
+                <?=count($docs)?> document<?=count($docs)>1?'s':''?>
+              </span>
+            </div>
+
+            <!-- Lignes locative + vénale -->
+            <?php foreach(['locative'=>'Valeur Locative','venale'=>'Valeur Vénale'] as $type=>$label):
+              if(!isset($docs[$type])) continue;
+              $e = $docs[$type];
+            ?>
+            <div class="exp-doc-row">
+              <div style="display:flex;align-items:center;gap:10px;min-width:0;flex:1;">
+                <a href="expertise_detail.php?bien_id=<?=$bien['id']?>&type=<?=$type?>"
+                   class="exp-type-badge <?=$type?>"
+                   style="text-decoration:none;cursor:pointer;display:inline-flex;align-items:center;gap:5px;">
+                  <?=$type==='locative'?'Locative':'Vénale'?>
+                  <svg width="9" height="9" viewBox="0 0 16 16" fill="none">
+                    <path d="M6 3h7v7M13 3 3 13" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                </a>
+                <span class="exp-filename">
+                  <?= !empty($e['rapport_pdf']) ? htmlspecialchars(basename($e['rapport_pdf'])) : '<em style="color:var(--muted)">Aucun fichier</em>' ?>
+                </span>
+              </div>
+              <div style="display:flex;gap:7px;flex-shrink:0;align-items:center;">
+                <?php if(!empty($e['rapport_pdf'])): ?>
+                  <button class="doc-btn" onclick="openPDF('<?=htmlspecialchars($e['rapport_pdf'])?>','<?=$label?> <?=$annee?>')">
+                    <svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M1 8s3-5 7-5 7 5 7 5-3 5-7 5-7-5-7-5z" stroke="currentColor" stroke-width="1.4"/><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.4"/></svg>
+                    Aperçu
+                  </button>
+                  <a class="doc-btn" href="<?=htmlspecialchars($e['rapport_pdf'])?>" download>
+                    <svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M8 2v8M5 7l3 3 3-3M3 13h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    Télécharger
+                  </a>
+                <?php endif; ?>
+                <?php if($canDelete): ?>
+                <form method="post" style="display:inline" onsubmit="return confirm('Supprimer ce rapport ?')">
+                  <input type="hidden" name="action" value="delete_expertise">
+                  <input type="hidden" name="expertise_id" value="<?=$e['id']?>">
+                  <input type="hidden" name="bien_id" value="<?=$bien['id']?>">
+                  <button class="doc-btn" type="submit" style="color:#DC2626;border-color:#FECACA;padding:6px 10px;">
+                    <svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M2 4h12M5 4V2h6v2M6 7v5M10 7v5M3 4l1 10h8l1-10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </button>
+                </form>
+                <?php endif; ?>
+              </div>
+            </div>
+            <?php endforeach; ?>
+
+          </div>
+          <?php endforeach; ?>
+        </div>
+      <?php endif; ?>
     </div>
 
   </div><!-- /docs-grid -->
@@ -846,8 +958,70 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
   </div>
 </div>
 
+<!-- ══ ADD EXPERTISE MODAL ══ -->
+<?php if($bien): ?>
+<div class="modal-bg" id="addExpertiseModal">
+  <div class="edit-inner" style="max-width:400px;">
+    <h2>Ajouter un rapport d'expertise</h2>
+    <form method="post" enctype="multipart/form-data">
+      <input type="hidden" name="action" value="add_expertise">
+      <input type="hidden" name="id" value="<?=$bien['id']?>">
+      <input type="hidden" name="valeur" value="0">
+      <div class="form-grid" style="grid-template-columns:1fr 1fr;">
+        <div class="form-group">
+          <label class="form-label">Type <span style="color:var(--accent)">*</span></label>
+          <select class="form-input" name="type" required>
+            <option value="locative">Valeur Locative</option>
+            <option value="venale">Valeur Vénale</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Année <span style="color:var(--accent)">*</span></label>
+          <input class="form-input" type="number" name="annee" min="1950" max="2099" value="<?=date('Y')?>" required>
+        </div>
+        <div class="form-group full">
+          <label class="form-label">Rapport PDF <span style="color:var(--accent)">*</span></label>
+          <div class="pdf-upload-field" style="margin-top:4px;">
+            <div class="pdf-upload-field-info">
+              <div class="pdf-upload-field-icon empty" id="exp_icon_wrap">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" stroke="#9CA3AF" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><line x1="12" y1="11" x2="12" y2="17" stroke="#9CA3AF" stroke-width="1.8" stroke-linecap="round"/><line x1="9" y1="14" x2="15" y2="14" stroke="#9CA3AF" stroke-width="1.8" stroke-linecap="round"/></svg>
+              </div>
+              <div>
+                <div class="pdf-upload-field-label">Fichier PDF</div>
+                <div class="pdf-upload-field-status" id="exp_status_label">Aucun fichier sélectionné</div>
+              </div>
+            </div>
+            <input type="file" name="rapport_pdf" id="exp_pdf_input" accept=".pdf" style="display:none;"
+                   onchange="updatePdfLabel(this)">
+            <label for="exp_pdf_input" class="pdf-upload-label">
+              <svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M8 12V4M5 7l3-3 3 3M3 13h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              Choisir
+            </label>
+          </div>
+        </div>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn btn-ghost"
+                onclick="document.getElementById('addExpertiseModal').classList.remove('open')">Annuler</button>
+        <button type="submit" class="btn btn-primary">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M8 2v12M2 8h12" stroke="white" stroke-width="2" stroke-linecap="round"/></svg>
+          Enregistrer
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+<?php endif; ?>
+
 <script>
-// ── Mise à jour visuelle après sélection d'un PDF ──
+function switchTab(tab, btn) {
+  document.querySelectorAll('.exp-tab').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelectorAll('.exp-table-wrap').forEach(el=>el.style.display='none');
+  const el = document.getElementById('tab-'+tab);
+  if(el) el.style.display='block';
+}
+
 function updatePdfLabel(input) {
   if (!input.files || !input.files.length) return;
   const file = input.files[0];

@@ -1,6 +1,7 @@
 <?php
 require_once 'config.php';
 if(!isLoggedIn()){ redirect('login.php'); }
+requireModuleAccess($pdo, 'biens_fonciers');
 $username = $_SESSION['username'] ?? 'Utilisateur';
 $departement = $_SESSION['departement'] ?? '';
 ?>

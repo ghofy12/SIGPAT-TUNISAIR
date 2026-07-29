@@ -1,44 +1,146 @@
 <?php
 require_once 'config.php';
 if(!isLoggedIn()){ redirect('login.php'); }
+requireModuleAccess($pdo, 'biens_loues');
 $username = $_SESSION['username'] ?? 'Utilisateur';
+
+$canCreate = hasModulePermission($pdo, 'biens_loues', 'create');
+$canUpdate = hasModulePermission($pdo, 'biens_loues', 'update');
+$canDelete = hasModulePermission($pdo, 'biens_loues', 'delete');
+
+// ── Protection CSRF ─────────────────────────────────────────────────────────
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+$csrf_token = $_SESSION['csrf_token'];
+
+// Valider le token sur toutes les mutations POST
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $tok = $_POST['csrf_token'] ?? '';
+    if (!hash_equals($csrf_token, $tok)) {
+        http_response_code(403);
+        exit(json_encode(['error' => 'Token CSRF invalide.']));
+    }
+}
+
 
 $zone = $_GET['zone'] ?? 'Tunisie';
 $isTN = $zone === 'Tunisie';
 
-// ── UPLOAD PDF ──
+// ── HELPER : dossier documents ────────────────────────────────────────────────
+function ensureDocDir(): string {
+    $dir = __DIR__ . DIRECTORY_SEPARATOR . 'documents' . DIRECTORY_SEPARATOR;
+    if (!is_dir($dir)) {
+        mkdir($dir, 0755, true);
+    }
+    return $dir;
+}
+
+// ── ADD ───────────────────────────────────────────────────────────────────────
+if(isset($_POST['action']) && $_POST['action']==='add'){
+    requireModulePermission($pdo, 'biens_loues', 'create');
+    $fields = ['adresse','reference','bailleur','entite','type_bien','superficie',
+               'statut','num_contrat','date_debut','date_fin','loyer_mensuel',
+               'budget_annuel','devise','preavis_resiliation','resp_interne',
+               'contact_bailleur','tel_bailleur','notes'];
+    $data = [];
+    foreach($fields as $f){
+        $v = $_POST[$f] ?? null;
+        $data[$f] = ($v === '' || $v === null) ? null : $v;
+    }
+    $data['renouvellement_auto'] = isset($_POST['renouvellement_auto']) ? 1 : 0;
+    $data['localisation']        = $zone;
+
+    $cols = implode(',', array_keys($data));
+    $phs  = implode(',', array_fill(0, count($data), '?'));
+    $pdo->prepare("INSERT INTO biens_loues_tunisair ($cols) VALUES ($phs)")
+        ->execute(array_values($data));
+    $newId = $pdo->lastInsertId();
+    header("Location: ?zone=".urlencode($zone)."&id=".$newId."&add_ok=1"); exit;
+}
+
+// ── EDIT ──────────────────────────────────────────────────────────────────────
+if(isset($_POST['action']) && $_POST['action']==='edit' && !empty($_POST['id'])){
+    requireModulePermission($pdo, 'biens_loues', 'update');
+    $fields = ['adresse','reference','bailleur','entite','type_bien','superficie',
+               'statut','num_contrat','date_debut','date_fin','loyer_mensuel',
+               'budget_annuel','devise','preavis_resiliation','resp_interne',
+               'contact_bailleur','tel_bailleur','notes'];
+    $sets = []; $vals = [];
+    foreach($fields as $f){
+        $v = $_POST[$f] ?? null;
+        $sets[] = "$f=?";
+        $vals[] = ($v === '' || $v === null) ? null : $v;
+    }
+    $sets[]  = "renouvellement_auto=?";
+    $vals[]  = isset($_POST['renouvellement_auto']) ? 1 : 0;
+    $vals[]  = (int)$_POST['id'];
+    $pdo->prepare("UPDATE biens_loues_tunisair SET ".implode(',',$sets)." WHERE id=?")
+        ->execute($vals);
+    header("Location: ?zone=".urlencode($zone)."&id=".(int)$_POST['id']."&edit_ok=1"); exit;
+}
+
+// ── DELETE BIEN ───────────────────────────────────────────────────────────────
+if(isset($_POST['action']) && $_POST['action']==='delete' && !empty($_POST['id'])){
+    requireModulePermission($pdo, 'biens_loues', 'delete');
+    $id = (int)$_POST['id'];
+    // Supprimer les PDFs liés
+    $row = $pdo->prepare("SELECT contrat_pdf,avenant_pdf,facture_pdf,bon_commande_pdf FROM biens_loues_tunisair WHERE id=?");
+    $row->execute([$id]); $row = $row->fetch();
+    if($row){ foreach($row as $path){ if($path && file_exists($path)) @unlink($path); } }
+    $pdo->prepare("DELETE FROM biens_loues_tunisair WHERE id=?")->execute([$id]);
+    header("Location: ?zone=".urlencode($zone)."&del_ok=1"); exit;
+}
+
+// ── UPLOAD PDF ────────────────────────────────────────────────────────────────
 if(isset($_POST['action']) && $_POST['action']==='upload_pdf' && !empty($_POST['id'])){
-    $pdfFields = ['contrat_pdf','avenant_pdf','facture_pdf','bon_commande_pdf'];
-    $uploaded = false;
+    requireModulePermission($pdo, 'biens_loues', 'update');
+    $pdfFields = ['contrat_pdf','avenant_pdf','facture_pdf','bon_commande_pdf','lettre_resiliation_pdf','decharge_facteur_pdf'];
+    $uploaded  = false;
+    $uploadErr = '';
     foreach($pdfFields as $pf){
-        if(!empty($_FILES[$pf]['tmp_name']) && $_FILES[$pf]['error'] === UPLOAD_ERR_OK){
-            $dir = 'documents/';
-            if(!is_dir($dir)) mkdir($dir, 0755, true);
-            $fname = $pf.'_bl_'.(int)$_POST['id'].'_'.time().'.pdf';
-            if(move_uploaded_file($_FILES[$pf]['tmp_name'], $dir.$fname)){
-                $old = $pdo->prepare("SELECT $pf FROM biens_loues_tunisair WHERE id=?");
-                $old->execute([(int)$_POST['id']]);
-                $oldRow = $old->fetch();
-                if($oldRow && !empty($oldRow[$pf]) && file_exists($oldRow[$pf])){
-                    @unlink($oldRow[$pf]);
-                }
-                $pdo->prepare("UPDATE biens_loues_tunisair SET $pf=? WHERE id=?")->execute([$dir.$fname, (int)$_POST['id']]);
-                $uploaded = true;
-            }
+        if(empty($_FILES[$pf]['tmp_name'])) continue;
+        $errCode = $_FILES[$pf]['error'];
+        if($errCode !== UPLOAD_ERR_OK){
+            $uploadErr = "Erreur upload ($pf) : code $errCode";
+            continue;
+        }
+        // Vérifier que c'est bien un PDF (magic bytes)
+        $finfo = finfo_open(FILEINFO_MIME_TYPE);
+        $mime  = finfo_file($finfo, $_FILES[$pf]['tmp_name']);
+        finfo_close($finfo);
+        if($mime !== 'application/pdf'){
+            $uploadErr = "Fichier non PDF détecté ($pf).";
+            continue;
+        }
+        $dir   = ensureDocDir();
+        $fname = $pf.'_bl_'.(int)$_POST['id'].'_'.time().'.pdf';
+        if(move_uploaded_file($_FILES[$pf]['tmp_name'], $dir.$fname)){
+            // Supprimer l'ancien fichier
+            $old = $pdo->prepare("SELECT $pf FROM biens_loues_tunisair WHERE id=?");
+            $old->execute([(int)$_POST['id']]); $oldRow = $old->fetch();
+            if($oldRow && !empty($oldRow[$pf]) && file_exists($oldRow[$pf])) @unlink($oldRow[$pf]);
+            // Stocker le chemin relatif (compatible Windows/Linux)
+            $relPath = 'documents/' . $fname;
+            $pdo->prepare("UPDATE biens_loues_tunisair SET $pf=? WHERE id=?")->execute([$relPath, (int)$_POST['id']]);
+            $uploaded = true;
+        } else {
+            $uploadErr = "move_uploaded_file a échoué pour $pf. Vérifiez les droits sur le dossier documents/.";
         }
     }
-    $status = $uploaded ? 'upload_ok=1' : 'upload_err=1';
+    $status = $uploaded ? 'upload_ok=1' : 'upload_err='.urlencode($uploadErr ?: 'Aucun fichier valide reçu');
     header("Location: ?zone=".urlencode($zone)."&id=".(int)$_POST['id']."&".$status);
     exit;
 }
 
-// ── DELETE PDF ──
+// ── DELETE PDF ────────────────────────────────────────────────────────────────
 if(isset($_POST['action']) && $_POST['action']==='delete_pdf' && !empty($_POST['id']) && !empty($_POST['field'])){
-    $allowed = ['contrat_pdf','avenant_pdf','facture_pdf','bon_commande_pdf'];
-    $field = $_POST['field'];
-    if(in_array($field,$allowed)){
+    requireModulePermission($pdo, 'biens_loues', 'update');
+    $allowed = ['contrat_pdf','avenant_pdf','facture_pdf','bon_commande_pdf','lettre_resiliation_pdf','decharge_facteur_pdf'];
+    $field   = $_POST['field'];
+    if(in_array($field, $allowed, true)){
         $row = $pdo->prepare("SELECT $field FROM biens_loues_tunisair WHERE id=?");
-        $row->execute([(int)$_POST['id']]); $row=$row->fetch();
+        $row->execute([(int)$_POST['id']]); $row = $row->fetch();
         if($row && !empty($row[$field]) && file_exists($row[$field])) @unlink($row[$field]);
         $pdo->prepare("UPDATE biens_loues_tunisair SET $field=NULL WHERE id=?")->execute([(int)$_POST['id']]);
     }
@@ -49,10 +151,13 @@ if(isset($_POST['action']) && $_POST['action']==='delete_pdf' && !empty($_POST['
 $stmt_all = $pdo->prepare("SELECT * FROM biens_loues_tunisair WHERE localisation=? ORDER BY adresse ASC");
 $stmt_all->execute([$zone]); $biens = $stmt_all->fetchAll();
 
-$total=count($biens); $actifs=0; $loues=0; $superficie_total=0; $loyer_total=0;
+$total=count($biens); $actifs=0; $expiring=0; $superficie_total=0; $loyer_total=0;
 foreach($biens as $b){
     if(stripos($b['statut']??'','actif')!==false) $actifs++;
-    if(!empty($b['locataire'])) $loues++;
+    if(!empty($b['date_fin'])){
+        $jours = (strtotime($b['date_fin']) - time()) / 86400;
+        if($jours >= 0 && $jours <= 60) $expiring++;
+    }
     $superficie_total += (float)($b['superficie']??0);
     $loyer_total      += (float)($b['loyer_mensuel']??0);
 }
@@ -237,22 +342,6 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
 
 /* ── PDF CARDS ── */
 .pdf-row{display:flex;gap:12px;flex-wrap:wrap;}
-.pdf-doc-card{background:var(--white);border:1px solid var(--rule);border-radius:12px;padding:14px;width:160px;display:flex;flex-direction:column;gap:10px;box-shadow:0 2px 8px rgba(0,0,0,.04);transition:box-shadow .15s,transform .15s;}
-.pdf-doc-card:hover{box-shadow:0 4px 16px rgba(0,0,0,.08);transform:translateY(-1px);}
-.pdf-doc-card-empty{opacity:.65;}
-.pdf-doc-icon{width:42px;height:42px;border-radius:10px;background:linear-gradient(135deg,var(--red-dark),var(--red));display:flex;align-items:center;justify-content:center;flex-shrink:0;}
-.pdf-doc-icon-empty{background:var(--bg);border:1.5px dashed #D1D5DB;}
-.pdf-doc-info{flex:1;}
-.pdf-doc-title{font-size:12px;font-weight:700;color:var(--ink);margin-bottom:3px;}
-.pdf-doc-name{font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:130px;}
-.pdf-doc-actions{display:flex;flex-direction:column;gap:5px;}
-.pdf-doc-btn{display:flex;align-items:center;justify-content:center;gap:6px;padding:6px 10px;border-radius:7px;font-size:11px;font-weight:600;cursor:pointer;border:1.5px solid var(--rule);background:var(--bg);color:var(--ink);font-family:'DM Sans',sans-serif;text-decoration:none;transition:background .14s,transform .12s;}
-.pdf-doc-btn:hover{background:#E5E7EB;transform:translateY(-1px);}
-.pdf-doc-btn-replace{background:var(--red);color:white;border-color:var(--red);}
-.pdf-doc-btn-replace:hover{background:var(--red-dark);}
-.pdf-doc-btn-upload{background:var(--accent);color:white;border-color:var(--accent);}
-.pdf-doc-btn-upload:hover{opacity:.9;}
-
 /* ── PDF CONTRACT FIELD BUTTON ── */
 .contrat-pdf-btn{
   display:inline-flex;align-items:center;gap:7px;padding:7px 14px;
@@ -348,6 +437,13 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
   .stat-card{min-width:calc(50% - 6px);}
 }
 </style>
+
+<!-- ══ PDF.js : convertit les PDF en image dans le navigateur (sans Imagick) ══ -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+</script>
 </head>
 <body>
 
@@ -380,9 +476,27 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
 <?php elseif(isset($_GET['upload_err'])): ?>
 <div class="toast err" id="toast">
   <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" stroke="#DC2626" stroke-width="1.4"/><path d="M5.5 5.5l5 5M10.5 5.5l-5 5" stroke="#DC2626" stroke-width="1.6" stroke-linecap="round"/></svg>
-  Erreur lors de l'upload. Vérifiez le fichier.
+  <?=htmlspecialchars(urldecode($_GET['upload_err']))?>
 </div>
-<script>setTimeout(()=>document.getElementById('toast')?.remove(),4000);</script>
+<script>setTimeout(()=>document.getElementById('toast')?.remove(),6000);</script>
+<?php elseif(isset($_GET['add_ok'])): ?>
+<div class="toast ok" id="toast">
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" stroke="#059669" stroke-width="1.4"/><path d="M5 8l2.5 2.5L11 5.5" stroke="#059669" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  Bien ajouté avec succès !
+</div>
+<script>setTimeout(()=>document.getElementById('toast')?.remove(),3500);</script>
+<?php elseif(isset($_GET['edit_ok'])): ?>
+<div class="toast ok" id="toast">
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" stroke="#059669" stroke-width="1.4"/><path d="M5 8l2.5 2.5L11 5.5" stroke="#059669" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  Modifications enregistrées !
+</div>
+<script>setTimeout(()=>document.getElementById('toast')?.remove(),3500);</script>
+<?php elseif(isset($_GET['del_ok'])): ?>
+<div class="toast ok" id="toast">
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" stroke="#059669" stroke-width="1.4"/><path d="M5 8l2.5 2.5L11 5.5" stroke="#059669" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  Bien supprimé.
+</div>
+<script>setTimeout(()=>document.getElementById('toast')?.remove(),3500);</script>
 <?php endif; ?>
 
 <div class="layout">
@@ -394,10 +508,12 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
         <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M10 3L5 8l5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
         Retour aux biens fonciers
       </a>
+      <?php if($canCreate): ?>
       <button class="btn-add" onclick="document.getElementById('addModal').classList.add('open')">
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M8 2v12M2 8h12" stroke="white" stroke-width="2" stroke-linecap="round"/></svg>
         Ajouter un bien
       </button>
+      <?php endif; ?>
     </div>
 
     <div class="sidebar-search">
@@ -417,7 +533,7 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
         $dotColor = str_contains($s,'actif')?'#22C55E':(str_contains($s,'expir')?'#EF4444':'#F59E0B');
         $bJson = htmlspecialchars(json_encode($b), ENT_QUOTES);
       ?>
-      <div class="bien-item <?=$selectedId===$b['id']?'active':''?>"
+      <div class="bien-item <?=$selectedId===(int)$b['id']?'active':''?>"
            data-id="<?=$b['id']?>"
            data-adresse="<?=htmlspecialchars(strtolower($b['adresse']??''))?>"
            onclick="selectBien(<?=$bJson?>)">
@@ -452,10 +568,10 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
         <div class="stat-value"><?=$actifs?></div>
         <div class="stat-sub">biens actifs</div>
       </div>
-      <div class="stat-card">
-        <div class="stat-label">Loués</div>
-        <div class="stat-value"><?=$loues?></div>
-        <div class="stat-sub">en location</div>
+      <div class="stat-card orange">
+        <div class="stat-label">Expirent bientôt</div>
+        <div class="stat-value"><?=$expiring?></div>
+        <div class="stat-sub">dans les 60 jours</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Superficie</div>
@@ -492,14 +608,18 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
             <div class="detail-ref" id="dp_ref"></div>
           </div>
           <div class="detail-header-actions">
+            <?php if($canUpdate): ?>
             <button class="hbtn hbtn-edit" id="dp_edit_btn">
               <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M11.5 2.5a1.414 1.414 0 0 1 2 2L5 13H3v-2L11.5 2.5z" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
               Modifier
             </button>
+            <?php endif; ?>
+            <?php if($canDelete): ?>
             <button class="hbtn hbtn-del" id="dp_del_btn">
               <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M2 4h12M5 4V3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1M6 7v5M10 7v5M3 4l1 9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1l1-9" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
               Supprimer
             </button>
+            <?php endif; ?>
           </div>
         </div>
 
@@ -579,40 +699,135 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
   </div>
 </div>
 
+<!-- ══ STYLES ANALYSE PDF ══ -->
+<style>
+.ai-analyze-zone{background:linear-gradient(135deg,rgba(200,16,46,.04),rgba(29,78,216,.04));border:2px dashed var(--accent);border-radius:13px;padding:16px 18px;margin-bottom:18px;transition:all .2s;}
+.ai-analyze-zone:hover{border-color:var(--accent);background:linear-gradient(135deg,rgba(200,16,46,.07),rgba(29,78,216,.07));}
+.ai-analyze-zone.loading{border-color:#D97706;background:rgba(217,119,6,.04);animation:aipulse 1.5s ease-in-out infinite;}
+.ai-analyze-zone.done{border-color:#059669;background:rgba(5,150,105,.04);border-style:solid;}
+@keyframes aipulse{0%,100%{opacity:1}50%{opacity:.6}}
+.ai-zone-top{display:flex;align-items:center;gap:10px;margin-bottom:8px;}
+.ai-zone-icon{width:36px;height:36px;border-radius:9px;background:linear-gradient(135deg,var(--accent-dark),var(--accent));display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.ai-zone-title{font-size:13px;font-weight:700;color:var(--ink);}
+.ai-zone-sub{font-size:11px;color:var(--muted);margin-top:2px;}
+.ai-upload-label{display:inline-flex;align-items:center;gap:7px;padding:8px 16px;border-radius:9px;background:linear-gradient(135deg,var(--accent-dark),var(--accent));color:white;font-size:12px;font-weight:600;cursor:pointer;transition:opacity .2s;border:none;font-family:inherit;}
+.ai-upload-label:hover{opacity:.88;}
+.ai-upload-label input{display:none;}
+.ai-file-info{display:none;align-items:center;gap:8px;margin-top:8px;padding:8px 12px;background:var(--white);border-radius:8px;border:1.5px solid var(--rule);font-size:12px;}
+.ai-file-info.show{display:flex;}
+.ai-spinner{width:14px;height:14px;border:2px solid rgba(0,0,0,.1);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0;}
+@keyframes spin{to{transform:rotate(360deg)}}
+.ai-status{font-size:11px;color:var(--muted);}
+.ai-result-badge{display:none;align-items:center;gap:6px;margin-top:8px;padding:7px 12px;background:#DCFCE7;border-radius:8px;border:1px solid #BBF7D0;font-size:12px;font-weight:600;color:#15803D;}
+.ai-result-badge.show{display:flex;}
+.ai-result-badge.warn{background:#FEF3C7;border-color:#FDE68A;color:#D97706;}
+.ai-fields-preview{display:none;margin-top:10px;padding:10px 12px;background:var(--white);border-radius:8px;border:1.5px solid var(--rule);font-size:11px;color:var(--muted);max-height:120px;overflow-y:auto;}
+.ai-fields-preview.show{display:block;}
+.ai-field-row{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--rule);}
+.ai-field-row:last-child{border-bottom:none;}
+.ai-field-key{font-weight:600;color:var(--ink);min-width:120px;}
+.ai-field-val{color:var(--accent);text-align:right;font-weight:500;}
+.ai-btn-analyze{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:8px;border:none;background:linear-gradient(135deg,var(--accent-dark),var(--accent));color:white;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;transition:opacity .2s;margin-top:8px;}
+.ai-btn-analyze:hover{opacity:.88;}
+.ai-btn-analyze:disabled{opacity:.5;cursor:not-allowed;}
+</style>
+<style>
+/* ── PDF doc cards améliorées ── */
+.pdf-doc-card { display:flex; align-items:center; gap:12px; padding:12px 14px; background:var(--white); border:1px solid var(--rule); border-radius:10px; margin-bottom:8px; transition:box-shadow .2s; }
+.pdf-doc-card:hover { box-shadow:0 2px 8px rgba(0,0,0,.08); }
+.pdf-doc-card-empty { background:var(--bg); border-style:dashed; }
+.pdf-doc-icon { width:38px; height:38px; border-radius:8px; background:linear-gradient(135deg,var(--accent-dark),var(--accent)); display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+.pdf-doc-icon-empty { background:transparent; border:2px dashed #D1D5DB; }
+.pdf-doc-icon.icon-resiliation { background:linear-gradient(135deg,#7C3AED,#A855F7); }
+.pdf-doc-icon.icon-decharge { background:linear-gradient(135deg,#059669,#10B981); }
+.pdf-doc-icon.icon-avenant { background:linear-gradient(135deg,#D97706,#F59E0B); }
+.pdf-doc-icon.icon-contrat { background:linear-gradient(135deg,var(--accent-dark),var(--accent)); }
+.pdf-doc-icon.icon-facture { background:linear-gradient(135deg,#2563EB,#3B82F6); }
+.pdf-doc-icon.icon-commande { background:linear-gradient(135deg,#0F766E,#14B8A6); }
+.pdf-doc-info { flex:1; min-width:0; }
+.pdf-doc-title { font-size:12px; font-weight:700; color:var(--ink); }
+.pdf-doc-name { font-size:11px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:200px; }
+.pdf-doc-actions { display:flex; gap:6px; flex-wrap:wrap; }
+.pdf-doc-btn { display:inline-flex; align-items:center; gap:4px; padding:5px 10px; border-radius:6px; font-size:11px; font-weight:500; cursor:pointer; border:1px solid var(--rule); background:var(--white); color:var(--ink); text-decoration:none; transition:background .15s; }
+.pdf-doc-btn:hover { background:var(--bg); }
+.pdf-doc-btn-upload { background:rgba(200,16,46,.08); border-color:rgba(200,16,46,.25); color:var(--accent); }
+.pdf-doc-btn-replace { background:rgba(217,119,6,.08); border-color:rgba(217,119,6,.25); color:#D97706; }
+.pdf-row { display:flex; flex-direction:row; flex-wrap:wrap; gap:12px; }
+.pdf-doc-card { display:flex; flex-direction:column; align-items:flex-start; gap:10px; padding:14px; background:var(--white); border:1px solid var(--rule); border-radius:12px; width:160px; min-width:140px; transition:box-shadow .2s; }
+.pdf-doc-card:hover { box-shadow:0 4px 16px rgba(0,0,0,.08); }
+.pdf-doc-card-empty { background:var(--bg); border-style:dashed; }
+.pdf-doc-info { flex:1; min-width:0; width:100%; }
+.pdf-doc-title { font-size:12px; font-weight:700; color:var(--ink); margin-bottom:3px; }
+.pdf-doc-name { font-size:10px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:130px; }
+.pdf-doc-actions { display:flex; flex-direction:column; gap:5px; width:100%; }
+</style>
+
 <!-- ADD MODAL -->
 <div class="modal-bg" id="addModal">
   <div class="edit-inner">
     <h2>Nouveau bien loué — <?=htmlspecialchars($zone)?></h2>
-    <p class="modal-sub">Seul le champ Adresse est obligatoire.</p>
+    <p class="modal-sub">Seul le champ Adresse est obligatoire. Vous pouvez analyser un contrat PDF pour remplir automatiquement le formulaire.</p>
+
+    <!-- ── ZONE ANALYSE PDF ── -->
+    <div class="ai-analyze-zone" id="addAiZone">
+      <div class="ai-zone-top">
+        <div class="ai-zone-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+            <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" stroke="white" stroke-width="1.6"/>
+            <path d="M14 2v6h6M9 13l2 2 4-4" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div>
+          <div class="ai-zone-title">🤖  extraction  automatiquement</div>
+          <div class="ai-zone-sub"> extrait automatiquement toutes les informations et remplit le formulaire</div>
+        </div>
+      </div>
+      <label class="ai-upload-label">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M8 12V4M5 7l3-3 3 3M3 13h10" stroke="white" stroke-width="1.5" stroke-linecap="round"/></svg>
+        Charger le contrat PDF
+        <input type="file" id="addPdfInput" accept=".pdf,application/pdf" onchange="aiAnalyzePDF(this,'add')">
+      </label>
+      <div class="ai-file-info" id="addFileInfo">
+        <div class="ai-spinner" id="addSpinner" style="display:none;"></div>
+        <span class="ai-status" id="addAiStatus">Prêt à analyser</span>
+      </div>
+      <div class="ai-result-badge" id="addResultBadge">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M3 8l4 4 6-7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span id="addResultText">Formulaire rempli avec succès</span>
+      </div>
+      <div class="ai-fields-preview" id="addFieldsPreview"></div>
+    </div>
+
     <form method="post" action="?zone=<?=urlencode($zone)?>">
       <input type="hidden" name="action" value="add">
+      <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($csrf_token)?>">
       <div class="modal-section">Identification</div>
       <div class="form-grid">
-        <div class="form-group full"><label class="form-label">Adresse <span style="color:var(--accent)">*</span></label><input class="form-input" type="text" name="adresse" required placeholder="Ex : 45 Rue de la République, Tunis"></div>
-        <div class="form-group"><label class="form-label">Référence</label><input class="form-input" type="text" name="reference" placeholder="BL-001"></div>
-        <div class="form-group"><label class="form-label">Bailleur</label><input class="form-input" type="text" name="bailleur"></div>
-        <div class="form-group"><label class="form-label">Entité TUNISAIR</label><input class="form-input" type="text" name="entite"></div>
-        <div class="form-group"><label class="form-label">Type de bien</label><input class="form-input" type="text" name="type_bien" placeholder="Bureau, Entrepôt…"></div>
-        <div class="form-group"><label class="form-label">Superficie (m²)</label><input class="form-input" type="number" step="0.01" name="superficie"></div>
+        <div class="form-group full"><label class="form-label">Adresse <span style="color:var(--accent)">*</span></label><input class="form-input" id="adresse" type="text" name="adresse" required placeholder="Ex : 45 Rue de la République, Tunis"></div>
+        <div class="form-group"><label class="form-label">Référence</label><input class="form-input" id="num_contrat" type="text" name="reference" placeholder="BL-001"></div>
+        <div class="form-group"><label class="form-label">Bailleur</label><input class="form-input" id="bailleur" type="text" name="bailleur"></div>
+        <div class="form-group"><label class="form-label">Entité TUNISAIR</label><input class="form-input" id="entite" type="text" name="entite"></div>
+        <div class="form-group"><label class="form-label">Type de bien</label><input class="form-input" id="type_bien" type="text" name="type_bien" placeholder="Bureau, Entrepôt…"></div>
+        <div class="form-group"><label class="form-label">Superficie (m²)</label><input class="form-input" id="superficie" type="number" step="0.01" name="superficie"></div>
         <div class="form-group"><label class="form-label">Statut</label>
-          <select class="form-input" name="statut">
+          <select class="form-input" id="statut" name="statut">
             <?php foreach(['Actif','Expiré','Résilié','Renouvellé','En négociation'] as $o): ?><option><?=$o?></option><?php endforeach; ?>
           </select>
         </div>
       </div>
       <div class="modal-section">Contrat</div>
       <div class="form-grid">
-        <div class="form-group"><label class="form-label">N° Contrat</label><input class="form-input" type="text" name="num_contrat"></div>
-        <div class="form-group"><label class="form-label">Date début</label><input class="form-input" type="date" name="date_debut"></div>
-        <div class="form-group"><label class="form-label">Date fin</label><input class="form-input" type="date" name="date_fin"></div>
-        <div class="form-group"><label class="form-label">Loyer mensuel</label><input class="form-input" type="number" step="0.01" name="loyer_mensuel"></div>
-        <div class="form-group"><label class="form-label">Budget annuel</label><input class="form-input" type="number" step="0.01" name="budget_annuel"></div>
+        <div class="form-group"><label class="form-label">N° Contrat</label><input class="form-input" id="add_num_contrat" type="text" name="num_contrat"></div>
+        <div class="form-group"><label class="form-label">Date début</label><input class="form-input" id="date_debut" type="date" name="date_debut"></div>
+        <div class="form-group"><label class="form-label">Date fin</label><input class="form-input" id="date_fin" type="date" name="date_fin"></div>
+        <div class="form-group"><label class="form-label">Loyer mensuel</label><input class="form-input" id="loyer_mensuel" type="number" step="0.01" name="loyer_mensuel"></div>
+        <div class="form-group"><label class="form-label">Budget annuel</label><input class="form-input" id="budget_annuel" type="number" step="0.01" name="budget_annuel"></div>
         <div class="form-group"><label class="form-label">Devise</label>
-          <select class="form-input" name="devise">
+          <select class="form-input" id="devise" name="devise">
             <?php foreach(['TND','EUR','USD','GBP','MAD'] as $d): ?><option><?=$d?></option><?php endforeach; ?>
           </select>
         </div>
-        <div class="form-group"><label class="form-label">Préavis résiliation (jours)</label><input class="form-input" type="number" name="preavis_resiliation"></div>
+        <div class="form-group"><label class="form-label">Préavis résiliation (jours)</label><input class="form-input" id="add_preavis" type="number" name="preavis_resiliation"></div>
         <div class="form-group form-check-group" style="padding-top:22px;">
           <input type="checkbox" name="renouvellement_auto" value="1" id="ren_add">
           <label for="ren_add" class="form-label" style="cursor:pointer;">Renouvellement auto.</label>
@@ -634,9 +849,41 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
   <div class="edit-inner">
     <h2>Modifier le bien loué</h2>
     <p class="modal-sub" id="editSub"></p>
+
+    <!-- ── ZONE ANALYSE PDF ── -->
+    <div class="ai-analyze-zone" id="editAiZone">
+      <div class="ai-zone-top">
+        <div class="ai-zone-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+            <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" stroke="white" stroke-width="1.6"/>
+            <path d="M14 2v6h6M9 13l2 2 4-4" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div>
+          <div class="ai-zone-title">🤖 Analyser un nouveau contrat PDF</div>
+          <div class="ai-zone-sub">Met à jour le formulaire avec les données extraites du PDF</div>
+        </div>
+      </div>
+      <label class="ai-upload-label">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M8 12V4M5 7l3-3 3 3M3 13h10" stroke="white" stroke-width="1.5" stroke-linecap="round"/></svg>
+        Charger un nouveau contrat PDF
+        <input type="file" id="editPdfInput" accept=".pdf,application/pdf" onchange="aiAnalyzePDF(this,'edit')">
+      </label>
+      <div class="ai-file-info" id="editFileInfo">
+        <div class="ai-spinner" id="editSpinner" style="display:none;"></div>
+        <span class="ai-status" id="editAiStatus">Prêt à analyser</span>
+      </div>
+      <div class="ai-result-badge" id="editResultBadge">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M3 8l4 4 6-7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span id="editResultText">Formulaire mis à jour avec succès</span>
+      </div>
+      <div class="ai-fields-preview" id="editFieldsPreview"></div>
+    </div>
+
     <form method="post" action="?zone=<?=urlencode($zone)?>" id="editForm">
       <input type="hidden" name="action" value="edit">
       <input type="hidden" name="id" id="edit_id">
+      <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($csrf_token)?>">
       <div class="modal-section">Identification</div>
       <div class="form-grid">
         <div class="form-group full"><label class="form-label">Adresse</label><input class="form-input" type="text" name="adresse" id="edit_adresse"></div>
@@ -691,6 +938,7 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
       <form method="post" style="display:inline">
         <input type="hidden" name="action" value="delete">
         <input type="hidden" name="id" id="delId">
+        <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($csrf_token)?>">
         <button type="submit" class="btn btn-danger">Supprimer</button>
       </form>
     </div>
@@ -699,6 +947,8 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
 
 <script>
 const ZONE = <?=json_encode($zone)?>;
+const CSRF_TOKEN = <?=json_encode($csrf_token)?>;
+const CAN_UPDATE  = <?=$canUpdate ? 'true' : 'false'?>;
 let currentBien = null;
 
 /* ── Close modals on backdrop ── */
@@ -823,8 +1073,10 @@ function selectBien(b){
        Ouvrir dans Google Maps
      </a>`;
 
-  document.getElementById('dp_edit_btn').onclick = () => openEdit(b);
-  document.getElementById('dp_del_btn').onclick  = () => openDelete(b.id, b.adresse);
+  const dpEditBtn = document.getElementById('dp_edit_btn');
+  const dpDelBtn  = document.getElementById('dp_del_btn');
+  if(dpEditBtn) dpEditBtn.onclick = () => openEdit(b);
+  if(dpDelBtn)  dpDelBtn.onclick  = () => openDelete(b.id, b.adresse);
 }
 
 /* ── buildDocs : formulaire upload par bien ── */
@@ -835,9 +1087,16 @@ function buildDocs(b){
   formsEl.innerHTML = '';
 
   const labelsMap = {
-    'facture_pdf'      : 'Facture',
-    'bon_commande_pdf' : 'Bon cmd.'
+    'contrat_pdf'           : 'Contrat',
+    'facture_pdf'           : 'Facture',
+    'bon_commande_pdf'      : 'Bon de commande',
+    'lettre_resiliation_pdf': 'Lettre de résiliation',
+    'decharge_facteur_pdf'  : 'Décharge facteur',
   };
+
+  // Supprimer l'ancien formulaire s'il existe (évite les doublons)
+  const oldFrm = document.getElementById('upform_' + b.id);
+  if(oldFrm) oldFrm.remove();
 
   const frm = document.createElement('form');
   frm.method      = 'post';
@@ -845,33 +1104,66 @@ function buildDocs(b){
   frm.id          = 'upform_' + b.id;
   frm.style.display = 'none';
   frm.action      = '?zone=' + encodeURIComponent(ZONE);
-  frm.innerHTML   = `<input type="hidden" name="action" value="upload_pdf">
-                     <input type="hidden" name="id"     value="${b.id}">`;
 
-  // Inclure aussi contrat_pdf dans le formulaire pour l'upload depuis la fiche contrat
-  ['contrat_pdf','facture_pdf','bon_commande_pdf'].forEach(pf => {
+  // Champs hidden (CORRECTIF : token CSRF ajouté)
+  const hidAction  = document.createElement('input');
+  hidAction.type   = 'hidden'; hidAction.name = 'action'; hidAction.value = 'upload_pdf';
+  const hidId      = document.createElement('input');
+  hidId.type       = 'hidden'; hidId.name = 'id'; hidId.value = b.id;
+  const hidCsrf    = document.createElement('input');
+  hidCsrf.type     = 'hidden'; hidCsrf.name = 'csrf_token'; hidCsrf.value = CSRF_TOKEN;
+  frm.appendChild(hidAction);
+  frm.appendChild(hidId);
+  frm.appendChild(hidCsrf);
+  ['contrat_pdf','avenant_pdf','facture_pdf','bon_commande_pdf','lettre_resiliation_pdf','decharge_facteur_pdf'].forEach(pf => {
     const inp = document.createElement('input');
     inp.type   = 'file';
     inp.name   = pf;
     inp.id     = `inp_${b.id}_${pf}`;
-    inp.accept = '.pdf';
+    inp.accept = '.pdf,application/pdf';
     inp.className = 'upload-hidden';
     inp.addEventListener('change', function(){
       if(!this.files || !this.files.length) return;
-      document.getElementById('uploadOverlay').classList.add('show');
-      frm.submit();
-      setTimeout(() => { try{ this.value=''; }catch(e){} }, 200);
+      if(this.files[0].size > 20 * 1024 * 1024){
+        alert('Fichier trop volumineux (max 20 Mo).');
+        this.value = '';
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const arr = new Uint8Array(e.target.result).subarray(0, 4);
+        const header = String.fromCharCode(...arr);
+        if(header !== '%PDF') {
+          alert('Ce fichier n\'est pas un PDF valide.');
+          return;
+        }
+        if(document.getElementById('uploadOverlay')) document.getElementById('uploadOverlay').classList.add('show');
+        frm.submit();
+      };
+      reader.readAsArrayBuffer(this.files[0]);
     });
     frm.appendChild(inp);
   });
 
-  formsEl.appendChild(frm);
+  // !! Attacher le form directement au body pour que les labels "for" fonctionnent
+  document.body.appendChild(frm);
+  formsEl.innerHTML = ''; // vider la zone (le form est dans body maintenant)
 
-  // Rendu des cartes (Facture + Bon commande seulement — Contrat est dans la section Contrat)
+  const iconClassMap = {
+    'contrat_pdf'           : 'icon-contrat',
+    'avenant_pdf'           : 'icon-avenant',
+    'facture_pdf'           : 'icon-facture',
+    'bon_commande_pdf'      : 'icon-commande',
+    'lettre_resiliation_pdf': 'icon-resiliation',
+    'decharge_facteur_pdf'  : 'icon-decharge',
+  };
+
+  // Rendu de toutes les cartes documents
   Object.keys(labelsMap).forEach(pf => {
-    const lbl  = labelsMap[pf];
-    const card = document.createElement('div');
-    const inputId = `inp_${b.id}_${pf}`;
+    const lbl      = labelsMap[pf];
+    const card     = document.createElement('div');
+    const inputId  = `inp_${b.id}_${pf}`;
+    const iconCls  = iconClassMap[pf] || '';
 
     if(b[pf]){
       const fname    = b[pf].split('/').pop();
@@ -879,15 +1171,17 @@ function buildDocs(b){
       const safeLbl  = (lbl + ' — ' + (b.adresse||'')).replace(/'/g,"\\'");
       card.className = 'pdf-doc-card';
       card.innerHTML =
-        `<div class="pdf-doc-icon">
-           <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-             <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8L14 2z" fill="white" opacity=".9"/>
-             <polyline points="14 2 14 8 20 8" stroke="white" stroke-width="1.5" fill="none"/>
-           </svg>
-         </div>
-         <div class="pdf-doc-info">
-           <div class="pdf-doc-title">${lbl}</div>
-           <div class="pdf-doc-name">${fname}</div>
+        `<div style="display:flex;align-items:center;gap:10px;width:100%;">
+           <div class="pdf-doc-icon ${iconCls}">
+             <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+               <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8L14 2z" fill="white" opacity=".9"/>
+               <polyline points="14 2 14 8 20 8" stroke="white" stroke-width="1.5" fill="none"/>
+             </svg>
+           </div>
+           <div class="pdf-doc-info">
+             <div class="pdf-doc-title">${lbl}</div>
+             <div class="pdf-doc-name">${fname}</div>
+           </div>
          </div>
          <div class="pdf-doc-actions">
            <button class="pdf-doc-btn" onclick="openPDF('${safeUrl}','${safeLbl}')">
@@ -898,31 +1192,43 @@ function buildDocs(b){
              <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 2v8M5 7l3 3 3-3M3 13h10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
              Télécharger
            </a>
-           <label class="pdf-doc-btn pdf-doc-btn-replace" for="${inputId}">
+           ${CAN_UPDATE ? `<label class="pdf-doc-btn pdf-doc-btn-replace" for="${inputId}" style="cursor:pointer;justify-content:center;">
              <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 12V4M5 7l3-3 3 3M3 13h10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
              Remplacer
            </label>
+           <form method="post" action="?zone=${encodeURIComponent(ZONE)}" style="display:contents" onsubmit="return confirm('Supprimer ce document ?')">
+             <input type="hidden" name="action" value="delete_pdf">
+             <input type="hidden" name="id" value="${b.id}">
+             <input type="hidden" name="field" value="${pf}">
+             <input type="hidden" name="csrf_token" value="${CSRF_TOKEN}">
+             <button type="submit" class="pdf-doc-btn" style="color:#DC2626;border-color:#FECACA;">
+               <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M2 4h12M5 4V3a1 1 0 011-1h4a1 1 0 011 1v1M6 7v5M10 7v5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+               Supprimer
+             </button>
+           </form>` : ''}
          </div>`;
     } else {
       card.className = 'pdf-doc-card pdf-doc-card-empty';
       card.innerHTML =
-        `<div class="pdf-doc-icon pdf-doc-icon-empty">
-           <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-             <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8L14 2z" stroke="#9CA3AF" stroke-width="1.5"/>
-             <polyline points="14 2 14 8 20 8" stroke="#9CA3AF" stroke-width="1.5"/>
-             <line x1="12" y1="11" x2="12" y2="17" stroke="#9CA3AF" stroke-width="1.5" stroke-linecap="round"/>
-             <line x1="9" y1="14" x2="15" y2="14" stroke="#9CA3AF" stroke-width="1.5" stroke-linecap="round"/>
-           </svg>
-         </div>
-         <div class="pdf-doc-info">
-           <div class="pdf-doc-title" style="color:var(--muted)">${lbl}</div>
-           <div class="pdf-doc-name">Aucun fichier</div>
+        `<div style="display:flex;align-items:center;gap:10px;width:100%;">
+           <div class="pdf-doc-icon pdf-doc-icon-empty">
+             <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+               <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8L14 2z" stroke="#9CA3AF" stroke-width="1.5"/>
+               <polyline points="14 2 14 8 20 8" stroke="#9CA3AF" stroke-width="1.5"/>
+               <line x1="12" y1="11" x2="12" y2="17" stroke="#9CA3AF" stroke-width="1.5" stroke-linecap="round"/>
+               <line x1="9" y1="14" x2="15" y2="14" stroke="#9CA3AF" stroke-width="1.5" stroke-linecap="round"/>
+             </svg>
+           </div>
+           <div class="pdf-doc-info">
+             <div class="pdf-doc-title" style="color:var(--muted)">${lbl}</div>
+             <div class="pdf-doc-name">Aucun fichier</div>
+           </div>
          </div>
          <div class="pdf-doc-actions">
-           <label class="pdf-doc-btn pdf-doc-btn-upload" for="${inputId}">
+           ${CAN_UPDATE ? `<label class="pdf-doc-btn pdf-doc-btn-upload" for="${inputId}" style="cursor:pointer;justify-content:center;">
              <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 12V4M5 7l3-3 3 3M3 13h10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
              Uploader
-           </label>
+           </label>` : '<span style="font-size:11px;color:var(--muted);">Aucun accès</span>'}
          </div>`;
     }
     docsEl.appendChild(card);
@@ -973,8 +1279,257 @@ function openDelete(id,name){
   document.getElementById('deleteModal').classList.add('open');
 }
 
+/* ══════════════════════════════════════════════════════════
+   ANALYSE PDF CONTRAT AVEC IA — Version PDF.js (sans Imagick)
+   1. PDF.js convertit la 1ère page en image JPEG dans le navigateur
+   2. L'image base64 est envoyée en JSON à extract_contrat.php
+   3. PHP appelle Ollama local → retourne JSON → remplit le formulaire
+══════════════════════════════════════════════════════════ */
+async function aiAnalyzePDF(input, mode) {
+  if (!input.files || !input.files[0]) return;
+  const file = input.files[0];
+
+  const prefix    = mode;
+  const zone_el   = document.getElementById(prefix + 'AiZone');
+  const info_el   = document.getElementById(prefix + 'FileInfo');
+  const spinner   = document.getElementById(prefix + 'Spinner');
+  const status_el = document.getElementById(prefix + 'AiStatus');
+  const badge_el  = document.getElementById(prefix + 'ResultBadge');
+  const badgeTxt  = document.getElementById(prefix + 'ResultText');
+  const preview   = document.getElementById(prefix + 'FieldsPreview');
+
+  // ── Reset UI ──
+  badge_el.classList.remove('show', 'warn');
+  preview.classList.remove('show');
+  preview.innerHTML = '';
+  zone_el.classList.remove('done');
+  zone_el.classList.add('loading');
+  info_el.classList.add('show');
+  spinner.style.display = 'block';
+
+  // ── Vider les champs remplis par le précédent OCR ──
+  const fieldsToClear = mode === 'add'
+    ? ['adresse','bailleur','entite','type_bien','superficie',
+       'add_num_contrat','date_debut','date_fin','loyer_mensuel',
+       'budget_annuel','devise','add_preavis','statut','ren_add']
+    : ['edit_adresse','edit_bailleur','edit_entite','edit_type_bien',
+       'edit_superficie','edit_num_contrat','edit_date_debut','edit_date_fin',
+       'edit_loyer_mensuel','edit_budget_annuel','edit_devise','edit_preavis',
+       'edit_contact_bailleur','edit_tel_bailleur','edit_statut','edit_notes','edit_ren_auto'];
+  fieldsToClear.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = false;
+    else el.value = '';
+  });
+  // Champs add sans id fixe (name="...")
+  if (mode === 'add') {
+    ['contact_bailleur','tel_bailleur','resp_interne','notes'].forEach(name => {
+      const el = document.querySelector('#addModal [name="' + name + '"]');
+      if (el) el.value = '';
+    });
+  }
+
+  try {
+    /* ── ÉTAPE 1 : Convertir le fichier en image base64 ── */
+    let imageBase64, imageType;
+    const isImage = file.type.startsWith('image/');
+
+    if (isImage) {
+      status_el.textContent = 'Préparation de l\'image…';
+      imageBase64 = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload  = () => resolve(reader.result.split(',')[1]);
+        reader.onerror = () => reject(new Error('Lecture fichier échouée'));
+        reader.readAsDataURL(file);
+      });
+      imageType = file.type;
+
+    } else {
+      // PDF → utiliser PDF.js pour rendre la 1ère page
+      if (typeof pdfjsLib === 'undefined') {
+        throw new Error('PDF.js non chargé. Vérifiez votre connexion internet.');
+      }
+      status_el.textContent = 'Chargement du PDF…';
+      const arrayBuffer = await file.arrayBuffer();
+      const pdfDoc      = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      const page        = await pdfDoc.getPage(1);
+      const viewport    = page.getViewport({ scale: 2.0 }); // ~150 DPI
+
+      const canvas  = document.createElement('canvas');
+      canvas.width  = viewport.width;
+      canvas.height = viewport.height;
+
+      status_el.textContent = 'Conversion PDF → image…';
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+
+      imageBase64 = canvas.toDataURL('image/jpeg', 0.90).split(',')[1];
+      imageType   = 'image/jpeg';
+    }
+
+    /* ── ÉTAPE 2 : Envoyer à extract_contrat.php ── */
+    status_el.textContent = 'Analyse IA en cours… (20–60 s)';
+
+    const controller = new AbortController();
+    const timer      = setTimeout(() => controller.abort(), 90000);
+
+    const resp = await fetch('extract_contrat.php', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        image_base64: imageBase64,
+        image_type:   imageType,
+        zone: typeof ZONE !== 'undefined' ? ZONE : 'Tunisie',
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    if (!resp.ok) {
+      const txt = await resp.text();
+      throw new Error('HTTP ' + resp.status + ' — ' + txt.substring(0, 150));
+    }
+
+    const data = await resp.json();
+    if (data.error) throw new Error(typeof data.error === 'string' ? data.error : JSON.stringify(data.error));
+
+    const extracted = data;
+
+    /* ── ÉTAPE 3 : Remplir le formulaire ── */
+    const ids = mode === 'add' ? {
+      adresse:             'adresse',
+      bailleur:            'bailleur',
+      entite:              'entite',
+      type_bien:           'type_bien',
+      superficie:          'superficie',
+      num_contrat:         'add_num_contrat',
+      date_debut:          'date_debut',
+      date_fin:            'date_fin',
+      loyer_mensuel:       'loyer_mensuel',
+      budget_annuel:       'budget_annuel',
+      devise:              'devise',
+      preavis_resiliation: 'add_preavis',
+      statut:              'statut',
+      renouvellement_auto: 'ren_add',
+      contact_bailleur:    null,
+      tel_bailleur:        null,
+      notes:               null,
+    } : {
+      adresse:             'edit_adresse',
+      bailleur:            'edit_bailleur',
+      entite:              'edit_entite',
+      type_bien:           'edit_type_bien',
+      superficie:          'edit_superficie',
+      num_contrat:         'edit_num_contrat',
+      date_debut:          'edit_date_debut',
+      date_fin:            'edit_date_fin',
+      loyer_mensuel:       'edit_loyer_mensuel',
+      budget_annuel:       'edit_budget_annuel',
+      devise:              'edit_devise',
+      preavis_resiliation: 'edit_preavis',
+      contact_bailleur:    'edit_contact_bailleur',
+      tel_bailleur:        'edit_tel_bailleur',
+      statut:              'edit_statut',
+      notes:               'edit_notes',
+      renouvellement_auto: 'edit_ren_auto',
+    };
+
+    // Mode add : champs sans ID fixe → sélection par [name]
+    if (mode === 'add') {
+      ['contact_bailleur', 'tel_bailleur', 'resp_interne', 'notes'].forEach(key => {
+        const el  = document.querySelector('#addModal [name="' + key + '"]');
+        const val = extracted[key];
+        if (el && val != null && val !== '') {
+          el.value = val;
+          el.style.transition = 'background .3s';
+          el.style.background = 'rgba(200,16,46,.08)';
+          setTimeout(() => { el.style.background = ''; }, 1400);
+        }
+      });
+    }
+
+    let filled = 0;
+    const fieldsDisplay = [];
+    const fieldLabels = {
+      adresse:'Adresse', bailleur:'Bailleur', entite:'Entité',
+      type_bien:'Type de bien', superficie:'Superficie',
+      num_contrat:'N° Contrat', date_debut:'Date début', date_fin:'Date fin',
+      loyer_mensuel:'Loyer/mois', budget_annuel:'Budget annuel', devise:'Devise',
+      preavis_resiliation:'Préavis', contact_bailleur:'Contact',
+      tel_bailleur:'Téléphone', statut:'Statut', notes:'Notes',
+      renouvellement_auto:'Renouvellement auto',
+    };
+
+    Object.entries(extracted).forEach(([key, val]) => {
+      if (val === null || val === undefined || val === '') return;
+
+      // Checkbox renouvellement_auto
+      if (key === 'renouvellement_auto') {
+        const el = document.getElementById(ids[key]);
+        if (el) {
+          el.checked = !!val;
+          filled++;
+          if (val) fieldsDisplay.push([fieldLabels[key], 'Oui']);
+        }
+        return;
+      }
+
+      const elId = ids[key];
+      if (!elId) return;
+      const el = document.getElementById(elId);
+      if (!el) return;
+
+      const strVal = String(val);
+      if (el.tagName === 'SELECT') {
+        const opts  = Array.from(el.options);
+        const match = opts.find(o =>
+          o.value.toLowerCase() === strVal.toLowerCase() ||
+          o.text.toLowerCase()  === strVal.toLowerCase()
+        );
+        el.value = match ? match.value : strVal;
+      } else {
+        el.value = strVal;
+      }
+      el.dispatchEvent(new Event('change'));
+      el.style.transition = 'background .3s';
+      el.style.background = 'rgba(200,16,46,.08)';
+      setTimeout(() => { el.style.background = ''; }, 1400);
+      filled++;
+      fieldsDisplay.push([fieldLabels[key] || key, strVal.length > 32 ? strVal.substring(0, 32) + '…' : strVal]);
+    });
+
+    /* ── ÉTAPE 4 : Afficher le résumé ── */
+    zone_el.classList.remove('loading');
+    zone_el.classList.add('done');
+    spinner.style.display = 'none';
+    status_el.textContent = '✓ ' + file.name;
+    badge_el.classList.add('show');
+    badgeTxt.textContent  = filled + ' champ' + (filled > 1 ? 's remplis' : ' rempli') + ' automatiquement';
+
+    if (fieldsDisplay.length) {
+      preview.classList.add('show');
+      preview.innerHTML = fieldsDisplay.map(([k, v]) =>
+        `<div class="ai-field-row"><span class="ai-field-key">${k}</span><span class="ai-field-val">${v}</span></div>`
+      ).join('');
+    }
+    input.value = '';
+
+  } catch (e) {
+    zone_el.classList.remove('loading');
+    spinner.style.display = 'none';
+    status_el.textContent = 'Erreur.';
+    badge_el.classList.add('show', 'warn');
+    if (e.name === 'AbortError') {
+      badgeTxt.textContent = 'Timeout (90 s). Réessayez avec un fichier plus léger.';
+    } else {
+      badgeTxt.textContent = (e.message || 'Erreur inconnue').substring(0, 180);
+    }
+    input.value = '';
+  }
+}
+
 <?php if($selectedId && $biens): ?>
-<?php foreach($biens as $b): if($b['id']===$selectedId): ?>
+<?php foreach($biens as $b): if((int)$b['id']===$selectedId): ?>
 selectBien(<?=json_encode($b)?>);
 <?php endif; endforeach; ?>
 <?php endif; ?>

@@ -6,6 +6,7 @@ if(isLoggedIn()) {
 }
 
 $error = '';
+$user  = null;
 
 if($_SERVER['REQUEST_METHOD'] === 'POST') {
     $email    = trim($_POST['email'] ?? '');
@@ -14,33 +15,39 @@ if($_SERVER['REQUEST_METHOD'] === 'POST') {
     if(!empty($email) && !empty($password)) {
         try {
             $stmt = $pdo->prepare("
-                SELECT u.*, r.nom AS role_nom, r.code AS role_code, r.niveau AS role_niveau 
-                FROM users u
-                LEFT JOIN roles r ON u.role_id = r.id
-                WHERE u.email = ? AND u.actif = 1
+                SELECT * FROM users
+                WHERE email = ? AND actif = 1
                 LIMIT 1
             ");
             $stmt->execute([$email]);
             $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
             if ($user && $password === $user['password']) {
-                $_SESSION['user_id']      = $user['id'];
-                $_SESSION['email']        = $user['email'];
-                $_SESSION['nom']          = $user['nom'];
-                $_SESSION['prenom']       = $user['prenom'];
-                $_SESSION['role_id']      = $user['role_id'];
-                $_SESSION['role_nom']     = $user['role_nom'];
-                $_SESSION['role_code']    = $user['role_code'];
-                $_SESSION['role_niveau']  = $user['role_niveau'];
-                $_SESSION['departement']  = $user['departement'];
-                $_SESSION['permissions']  = getModulePermissions($pdo, $user['role_id']);
 
-                $stmt = $pdo->prepare("UPDATE users SET derniere_connexion = NOW() WHERE id = ?");
-                $stmt->execute([$user['id']]);
+                $roleStmt = $pdo->prepare("SELECT * FROM roles WHERE code = ? AND actif = 1");
+                $roleStmt->execute([$user['role_id']]);
+                $roleInfo = $roleStmt->fetch(PDO::FETCH_ASSOC);
 
-                logActivity($pdo, $user['id'], 'Connexion au système', 'authentification');
-                redirect('dashboard.php');
-                exit;
+                if (!$roleInfo) {
+                    $error = "Votre profil n'est pas configuré ou est inactif. Contactez un administrateur.";
+                } else {
+                    $_SESSION['user_id']     = $user['id'];
+                    $_SESSION['email']       = $user['email'];
+                    $_SESSION['nom']         = $user['nom'];
+                    $_SESSION['prenom']      = $user['prenom'];
+                    $_SESSION['username']    = trim($user['prenom'] . ' ' . $user['nom']);
+                    $_SESSION['role_id']     = $roleInfo['code'];
+                    $_SESSION['role_nom']    = $roleInfo['nom'];
+                    $_SESSION['role_niveau'] = $roleInfo['niveau'];
+                    $_SESSION['departement'] = $user['departement'] ?? '';
+
+                    $stmt2 = $pdo->prepare("UPDATE users SET derniere_connexion = NOW() WHERE id = ?");
+                    $stmt2->execute([$user['id']]);
+
+                    logActivity($pdo, $user['id'], 'Connexion au système', 'authentification');
+                    redirect('dashboard.php');
+                    exit;
+                }
             } else {
                 $error = "Email ou mot de passe incorrect.";
             }
@@ -58,24 +65,26 @@ if($_SERVER['REQUEST_METHOD'] === 'POST') {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Connexion · TUNISAIR</title>
+<title>Connexion — TUNISAIR Patrimoine</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
-*,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
   --red:       #C8102E;
   --red-dark:  #9B0E23;
+  --red-light: #F5E6E9;
   --navy:      #0F2563;
-  --navy-mid:  #1D4ED8;
+  --navy-2:    #1D4ED8;
   --ink:       #1A1A18;
+  --sub:       #374151;
   --muted:     #6B7280;
+  --border:    rgba(0,0,0,.07);
   --bg:        #F4F6F9;
   --white:     #ffffff;
-  --rule:      rgba(0,0,0,.07);
-  --shadow:    0 4px 24px rgba(0,0,0,.09);
+  --shadow:    0 4px 20px rgba(0,0,0,.07);
   --glow-red:  rgba(200,16,46,.18);
 }
 
@@ -86,227 +95,278 @@ html, body {
   color: var(--ink);
 }
 
-/* ══ BACKGROUND SPLIT ══ */
-body {
+/* ══ LAYOUT ══ */
+.layout {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 480px 1fr;
   min-height: 100vh;
 }
 
-/* ══ LEFT PANEL ══ */
+/* ══ PANNEAU GAUCHE ══ */
 .panel-left {
-  background: linear-gradient(145deg, var(--navy) 0%, #1E3A8A 60%, var(--navy-mid) 100%);
+  background: var(--navy);
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 60px 48px;
+  padding: 0;
   position: relative;
   overflow: hidden;
 }
 
-/* Geometric decorations */
+/* Lignes décoratives géométriques */
 .panel-left::before {
   content: '';
   position: absolute;
-  top: -80px; right: -80px;
-  width: 320px; height: 320px;
+  top: -120px; right: -120px;
+  width: 400px; height: 400px;
+  border: 1px solid rgba(255,255,255,.06);
   border-radius: 50%;
-  background: rgba(255,255,255,.04);
-  pointer-events: none;
 }
 .panel-left::after {
   content: '';
   position: absolute;
-  bottom: -60px; left: -60px;
-  width: 240px; height: 240px;
+  bottom: -80px; left: -80px;
+  width: 280px; height: 280px;
+  border: 1px solid rgba(200,16,46,.15);
   border-radius: 50%;
-  background: rgba(200,16,46,.12);
-  pointer-events: none;
 }
 
 .panel-left-inner {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 52px 48px;
   position: relative;
   z-index: 1;
-  text-align: center;
 }
 
-.brand-logo {
-  width: 130px;
-  height: auto;
-  margin-bottom: 28px;
-  filter: drop-shadow(0 8px 24px rgba(0,0,0,.3));
-  animation: floatLogo 4s ease-in-out infinite;
-}
-@keyframes floatLogo {
-  0%,100% { transform: translateY(0); }
-  50%      { transform: translateY(-8px); }
-}
-
-.brand-title {
-  font-size: 34px;
-  font-weight: 700;
-  color: white;
-  letter-spacing: .04em;
-  margin-bottom: 10px;
-}
-.brand-line {
-  width: 48px; height: 3px;
-  background: var(--red);
-  border-radius: 2px;
-  margin: 0 auto 18px;
-}
-.brand-subtitle {
-  font-size: 14px;
-  font-weight: 400;
-  color: rgba(255,255,255,.65);
-  line-height: 1.65;
-  max-width: 280px;
-  margin: 0 auto 40px;
-}
-
-/* Stats déco */
-.panel-stats {
+/* Logo + marque */
+.brand {
   display: flex;
-  gap: 24px;
+  align-items: center;
+  gap: 16px;
+}
+.brand-logo {
+  width: 56px;
+  height: 56px;
+  border-radius: 12px;
+  background: var(--white);
+  display: flex;
+  align-items: center;
   justify-content: center;
-  flex-wrap: wrap;
+  flex-shrink: 0;
+  overflow: hidden;
 }
-.panel-stat {
-  text-align: center;
-  padding: 16px 22px;
-  border-radius: 14px;
-  background: rgba(255,255,255,.07);
-  border: 1px solid rgba(255,255,255,.1);
-  backdrop-filter: blur(8px);
-  min-width: 90px;
+.brand-logo img {
+  width: 48px;
+  height: 48px;
+  object-fit: contain;
 }
-.panel-stat-val {
-  font-size: 22px;
+.brand-text {}
+.brand-name {
+  font-size: 18px;
   font-weight: 700;
-  color: white;
+  color: var(--white);
+  letter-spacing: .04em;
   line-height: 1;
 }
-.panel-stat-lbl {
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: .12em;
-  text-transform: uppercase;
+.brand-sub {
+  font-size: 11px;
+  font-weight: 400;
   color: rgba(255,255,255,.45);
-  margin-top: 6px;
+  margin-top: 4px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
 }
 
-/* ══ RIGHT PANEL (form) ══ */
+/* Texte central */
+.panel-center {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 48px 0;
+}
+.panel-tagline {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--white);
+  line-height: 1.35;
+  letter-spacing: -.01em;
+  margin-bottom: 16px;
+  max-width: 320px;
+}
+.panel-tagline em {
+  color: var(--red);
+  font-style: normal;
+}
+.panel-desc {
+  font-size: 13.5px;
+  color: rgba(255,255,255,.5);
+  line-height: 1.7;
+  max-width: 300px;
+}
+
+/* Séparateur rouge */
+.red-bar {
+  width: 40px;
+  height: 3px;
+  background: var(--red);
+  border-radius: 2px;
+  margin-bottom: 24px;
+}
+
+/* Indicateurs bas */
+.panel-indicators {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+.indicator {
+  padding: 16px 14px;
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 10px;
+  background: rgba(255,255,255,.04);
+}
+.indicator-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: rgba(255,255,255,.08);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 10px;
+}
+.indicator-icon svg {
+  color: rgba(255,255,255,.7);
+}
+.indicator-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: rgba(255,255,255,.35);
+}
+.indicator-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(255,255,255,.8);
+  margin-top: 3px;
+}
+
+/* ══ PANNEAU DROIT ══ */
 .panel-right {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 60px 48px;
+  padding: 48px 40px;
   background: var(--bg);
 }
 
-.login-card {
+.login-box {
   width: 100%;
-  max-width: 420px;
-  animation: fadeUp .45s ease both;
-}
-@keyframes fadeUp {
-  from { opacity:0; transform:translateY(16px); }
-  to   { opacity:1; transform:none; }
+  max-width: 380px;
+  background: var(--white);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--red);
+  padding: 36px 34px;
 }
 
-.login-heading {
-  margin-bottom: 8px;
+/* En-tête formulaire */
+.login-header {
+  margin-bottom: 36px;
 }
-.login-heading h2 {
-  font-size: 24px;
+.login-title {
+  font-size: 22px;
   font-weight: 700;
   color: var(--ink);
-  letter-spacing: .01em;
+  letter-spacing: -.01em;
+  margin-bottom: 6px;
 }
-.login-heading p {
-  font-size: 13px;
+.login-subtitle {
+  font-size: 13.5px;
   color: var(--muted);
-  margin-top: 6px;
+  font-weight: 400;
+  line-height: 1.55;
 }
 
+/* Ligne de séparation */
 .login-divider {
   height: 1px;
-  background: var(--rule);
-  margin: 22px 0;
+  background: var(--border);
+  margin-bottom: 28px;
 }
 
-/* ── ERROR ── */
-.alert-error {
+/* Erreur */
+.alert {
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  background: #FEF2F2;
-  border: 1.5px solid #FECACA;
-  border-left: 4px solid #DC2626;
-  border-radius: 10px;
-  padding: 13px 15px;
+  padding: 12px 14px;
+  border-radius: 8px;
   margin-bottom: 22px;
   font-size: 13px;
-  color: #B91C1C;
-  animation: shake .35s ease;
+  font-weight: 500;
+  border-left: 3px solid;
 }
-@keyframes shake {
-  0%,100% { transform: translateX(0); }
-  25%      { transform: translateX(-6px); }
-  75%      { transform: translateX(6px); }
+.alert-error {
+  background: #FEF2F2;
+  border-color: var(--red);
+  color: #991B1B;
 }
-.alert-error svg { flex-shrink: 0; margin-top: 1px; }
+.alert svg { flex-shrink: 0; margin-top: 1px; }
 
-/* ── FORM ── */
-.form-group {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
+/* Champs */
+.field {
   margin-bottom: 18px;
 }
-.form-label {
-  font-size: 10px;
+.field-label {
+  display: block;
+  font-size: 11px;
   font-weight: 600;
-  letter-spacing: .12em;
+  letter-spacing: .08em;
   text-transform: uppercase;
-  color: var(--muted);
+  color: var(--sub);
+  margin-bottom: 7px;
 }
-.input-wrap {
+.field-wrap {
   position: relative;
 }
-.input-icon {
+.field-icon {
   position: absolute;
-  left: 13px;
+  left: 12px;
   top: 50%;
   transform: translateY(-50%);
   color: var(--muted);
   pointer-events: none;
+  display: flex;
 }
-.form-input {
+.field-input {
   width: 100%;
-  padding: 11px 14px 11px 40px;
+  padding: 11px 14px 11px 38px;
+  border: 1.5px solid var(--border);
   border-radius: 10px;
-  border: 1.5px solid var(--rule);
-  background: var(--white);
+  background: var(--bg);
   font-family: 'DM Sans', sans-serif;
-  font-size: 14px;
+  font-size: 13.5px;
   color: var(--ink);
   outline: none;
-  box-shadow: var(--shadow);
-  transition: border-color .2s, box-shadow .2s;
+  transition: border-color .2s, box-shadow .2s, background .2s;
 }
-.form-input:focus {
+.field-input:focus {
   border-color: var(--red);
-  box-shadow: 0 0 0 3px var(--glow-red);
+  background: var(--white);
+  box-shadow: 0 0 0 3px rgba(200,16,46,.08);
 }
-.form-input::placeholder { color: #C4C9D4; }
+.field-input::placeholder { color: #C4C9D4; }
 
-/* toggle password */
 .toggle-pw {
   position: absolute;
-  right: 13px;
+  right: 12px;
   top: 50%;
   transform: translateY(-50%);
   background: none;
@@ -314,170 +374,221 @@ body {
   cursor: pointer;
   color: var(--muted);
   padding: 0;
-  display: grid;
-  place-items: center;
+  display: flex;
+  align-items: center;
   transition: color .15s;
 }
 .toggle-pw:hover { color: var(--ink); }
 
-/* ── SUBMIT BUTTON ── */
-.btn-login {
+/* Bouton */
+.btn-submit {
   width: 100%;
-  padding: 13px;
-  background: linear-gradient(130deg, var(--red-dark), var(--red));
+  padding: 12px;
+  background: var(--red);
   color: white;
   border: none;
   border-radius: 10px;
   font-family: 'DM Sans', sans-serif;
   font-size: 14px;
   font-weight: 600;
-  letter-spacing: .02em;
+  letter-spacing: .01em;
   cursor: pointer;
-  box-shadow: 0 6px 20px var(--glow-red);
-  transition: transform .2s, box-shadow .2s;
-  margin-top: 6px;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: 9px;
+  transition: background .2s, transform .15s, box-shadow .2s;
+  box-shadow: 0 3px 10px var(--glow-red);
+  margin-top: 8px;
 }
-.btn-login:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 10px 28px var(--glow-red);
+.btn-submit:hover {
+  background: var(--red-dark);
+  transform: translateY(-1px);
+  box-shadow: 0 5px 16px var(--glow-red);
 }
-.btn-login:active { transform: translateY(0); }
+.btn-submit:active { transform: none; }
 
-/* ── FOOTER ── */
+/* Pied de page */
 .login-footer {
-  margin-top: 32px;
+  margin-top: 36px;
+  padding-top: 22px;
+  border-top: 1px solid var(--border);
   text-align: center;
-  font-size: 11px;
-  color: var(--muted);
-  border-top: 1px solid var(--rule);
-  padding-top: 20px;
 }
-.login-footer strong { color: var(--ink); }
+.login-footer p {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.login-footer strong { color: var(--sub); font-weight: 600; }
 
-/* ══ RESPONSIVE ══ */
-@media (max-width: 768px) {
-  body { grid-template-columns: 1fr; }
+/* Responsive */
+@media (max-width: 820px) {
+  .layout { grid-template-columns: 1fr; }
   .panel-left { display: none; }
-  .panel-right { padding: 40px 24px; justify-content: flex-start; padding-top: 60px; }
+  .panel-right { padding: 40px 24px; background: var(--bg); }
 }
 </style>
 </head>
 <body>
 
-<!-- ══ LEFT PANEL ══ -->
-<div class="panel-left">
-  <div class="panel-left-inner">
-    <img src="logo.webp" alt="TUNISAIR" class="brand-logo">
-    <div class="brand-title">TUNISAIR</div>
-    <div class="brand-line"></div>
-    <p class="brand-subtitle">
-      Système de Gestion du Patrimoine <br>
-      Accès sécurisé aux équipes autorisées
-    </p>
-    <div class="panel-stats">
-      <div class="panel-stat">
-        <div class="panel-stat-val">🇹🇳</div>
-        <div class="panel-stat-lbl">Tunisie</div>
+<div class="layout">
+
+  <!-- ══ PANNEAU GAUCHE ══ -->
+  <div class="panel-left">
+    <div class="panel-left-inner">
+
+      <!-- Marque -->
+      <div class="brand">
+        <div class="brand-logo">
+          <img src="logo.webp" alt="TUNISAIR">
+        </div>
+        <div class="brand-text">
+          <div class="brand-name">TUNISAIR</div>
+          <div class="brand-sub">Gestion du Patrimoine</div>
+        </div>
       </div>
-      <div class="panel-stat">
-        <div class="panel-stat-val">🌍</div>
-        <div class="panel-stat-lbl">International</div>
+
+      <!-- Texte central -->
+      <div class="panel-center">
+        <div class="red-bar"></div>
+        <h1 class="panel-tagline">
+          Système de gestion<br>
+          du <em>patrimoine</em><br>
+        </h1>
+        <p class="panel-desc">
+          Plateforme centralisée de suivi des biens fonciers, mobiliers, concessions et du parc automobile de TUNISAIR.
+        </p>
       </div>
-      <div class="panel-stat">
-        <div class="panel-stat-val">🔒</div>
-        <div class="panel-stat-lbl">Sécurisé</div>
+
+      <!-- Indicateurs -->
+      <div class="panel-indicators">
+        <div class="indicator">
+          <div class="indicator-icon">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+              <polyline points="9 22 9 12 15 12 15 22"/>
+            </svg>
+          </div>
+          <div class="indicator-label">Périmètre</div>
+          <div class="indicator-value">National</div>
+        </div>
+        <div class="indicator">
+          <div class="indicator-icon">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="2" y1="12" x2="22" y2="12"/>
+              <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+            </svg>
+          </div>
+          <div class="indicator-label">Couverture</div>
+          <div class="indicator-value">International</div>
+        </div>
+        <div class="indicator">
+          <div class="indicator-icon">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+          </div>
+          <div class="indicator-label">Accès</div>
+          <div class="indicator-value">Sécurisé</div>
+        </div>
       </div>
+
     </div>
   </div>
-</div>
 
-<!-- ══ RIGHT PANEL ══ -->
-<div class="panel-right">
-  <div class="login-card">
+  <!-- ══ PANNEAU DROIT ══ -->
+  <div class="panel-right">
+    <div class="login-box">
 
-    <div class="login-heading">
-      <h2>Bienvenue 👋</h2>
-      <p>Connectez-vous pour accéder à votre espace de gestion.</p>
-    </div>
-
-    <div class="login-divider"></div>
-
-    <?php if($error): ?>
-    <div class="alert-error">
-      <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-        <circle cx="8" cy="8" r="7" stroke="#DC2626" stroke-width="1.5"/>
-        <path d="M8 5v3.5M8 10.5v.5" stroke="#DC2626" stroke-width="1.5" stroke-linecap="round"/>
-      </svg>
-      <?=htmlspecialchars($error)?>
-    </div>
-    <?php endif; ?>
-
-    <form method="POST" action="" autocomplete="on">
-
-      <div class="form-group">
-        <label class="form-label" for="email">Adresse Email</label>
-        <div class="input-wrap">
-          <span class="input-icon">
-            <svg width="15" height="15" viewBox="0 0 20 20" fill="none">
-              <path d="M2.5 5.5A1.5 1.5 0 0 1 4 4h12a1.5 1.5 0 0 1 1.5 1.5v9A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5v-9z" stroke="currentColor" stroke-width="1.3"/>
-              <path d="M2.5 6l7.5 5 7.5-5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-            </svg>
-          </span>
-          <input type="email" id="email" name="email" class="form-input"
-                 placeholder="votre.email@tunisair.tn"
-                 value="<?=htmlspecialchars($_POST['email']??'')?>"
-                 autocomplete="email">
-        </div>
+      <div class="login-header">
+        <h2 class="login-title">Connexion</h2>
+        <p class="login-subtitle">Entrez vos identifiants pour accéder à votre espace.</p>
       </div>
 
-      <div class="form-group">
-        <label class="form-label" for="password">Mot de passe</label>
-        <div class="input-wrap">
-          <span class="input-icon">
-            <svg width="15" height="15" viewBox="0 0 20 20" fill="none">
-              <rect x="3" y="9" width="14" height="9" rx="1.5" stroke="currentColor" stroke-width="1.3"/>
-              <path d="M6.5 9V6.5a3.5 3.5 0 0 1 7 0V9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-            </svg>
-          </span>
-          <input type="password" id="password" name="password" class="form-input"
-                 placeholder="••••••••"
-                 autocomplete="current-password">
-          <button type="button" class="toggle-pw" onclick="togglePassword()" title="Afficher / masquer">
-            <svg id="eyeIcon" width="16" height="16" viewBox="0 0 20 20" fill="none">
-              <path d="M2 10s3-6 8-6 8 6 8 6-3 6-8 6-8-6-8-6z" stroke="currentColor" stroke-width="1.3"/>
-              <circle cx="10" cy="10" r="2.5" stroke="currentColor" stroke-width="1.3"/>
-            </svg>
-          </button>
-        </div>
-      </div>
+      <div class="login-divider"></div>
 
-      <button type="submit" class="btn-login">
-        <svg width="15" height="15" viewBox="0 0 20 20" fill="none">
-          <path d="M3 10h14M11 4l6 6-6 6" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+      <?php if($error): ?>
+      <div class="alert alert-error">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
+          <circle cx="8" cy="8" r="7" stroke="#991B1B" stroke-width="1.5"/>
+          <path d="M8 5v3M8 10.5v.5" stroke="#991B1B" stroke-width="1.5" stroke-linecap="round"/>
         </svg>
-        Se connecter
-      </button>
+        <?= htmlspecialchars($error) ?>
+      </div>
+      <?php endif; ?>
 
-    </form>
+      <form method="POST" autocomplete="on">
 
-    <div class="login-footer">
-      <p>© <?=date('Y')?> <strong>TUNISAIR</strong> · Gestion du Patrimoine · v<?=APP_VERSION?></p>
+        <div class="field">
+          <label class="field-label" for="email">Adresse e-mail</label>
+          <div class="field-wrap">
+            <span class="field-icon">
+              <svg width="15" height="15" viewBox="0 0 20 20" fill="none">
+                <path d="M2.5 5.5A1.5 1.5 0 0 1 4 4h12a1.5 1.5 0 0 1 1.5 1.5v9A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5v-9z" stroke="currentColor" stroke-width="1.3"/>
+                <path d="M2.5 6l7.5 5 7.5-5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+              </svg>
+            </span>
+            <input
+              type="email" id="email" name="email"
+              class="field-input"
+              placeholder="prenom.nom@tunisair.com.tn"
+              value="<?= htmlspecialchars($_POST['email'] ?? '') ?>"
+              autocomplete="email"
+              required>
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="password">Mot de passe</label>
+          <div class="field-wrap">
+            <span class="field-icon">
+              <svg width="15" height="15" viewBox="0 0 20 20" fill="none">
+                <rect x="3" y="9" width="14" height="9" rx="1.5" stroke="currentColor" stroke-width="1.3"/>
+                <path d="M6.5 9V6.5a3.5 3.5 0 0 1 7 0V9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+              </svg>
+            </span>
+            <input
+              type="password" id="password" name="password"
+              class="field-input"
+              placeholder="••••••••••"
+              autocomplete="current-password"
+              required>
+            <button type="button" class="toggle-pw" onclick="togglePw()" title="Afficher / masquer">
+              <svg id="eye" width="16" height="16" viewBox="0 0 20 20" fill="none">
+                <path d="M2 10s3-6 8-6 8 6 8 6-3 6-8 6-8-6-8-6z" stroke="currentColor" stroke-width="1.3"/>
+                <circle cx="10" cy="10" r="2.5" stroke="currentColor" stroke-width="1.3"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <button type="submit" class="btn-submit">
+          <svg width="15" height="15" viewBox="0 0 20 20" fill="none">
+            <path d="M3 10h14M11 4l6 6-6 6" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Se connecter
+        </button>
+
+      </form>
+
+      <div class="login-footer">
+        <p>© <?= date('Y') ?> <strong>TUNISAIR</strong> · Gestion du Patrimoine · v<?= APP_VERSION ?></p>
+      </div>
+
     </div>
-
   </div>
+
 </div>
 
 <script>
-function togglePassword() {
-  const input = document.getElementById('password');
-  const icon  = document.getElementById('eyeIcon');
-  const show  = input.type === 'password';
-  input.type  = show ? 'text' : 'password';
-  icon.innerHTML = show
+function togglePw() {
+  const inp = document.getElementById('password');
+  const ico = document.getElementById('eye');
+  const show = inp.type === 'password';
+  inp.type = show ? 'text' : 'password';
+  ico.innerHTML = show
     ? `<path d="M3 3l14 14M8.5 8.7A2.5 2.5 0 0 0 12 12M5.3 5.5C3.8 6.8 2.7 8.6 2 10c1.7 3.3 5 6 8 6a8.5 8.5 0 0 0 4.7-1.5M9 4.1C9.3 4 9.7 4 10 4c3.3 0 6.3 2.7 8 6-.6 1.1-1.4 2.3-2.4 3.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>`
     : `<path d="M2 10s3-6 8-6 8 6 8 6-3 6-8 6-8-6-8-6z" stroke="currentColor" stroke-width="1.3"/><circle cx="10" cy="10" r="2.5" stroke="currentColor" stroke-width="1.3"/>`;
 }

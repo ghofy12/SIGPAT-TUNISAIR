@@ -1,6 +1,7 @@
 <?php
 require_once 'config.php';
 if(!isLoggedIn()){ redirect('login.php'); }
+requireModuleAccess($pdo, 'biens_loues');
 $username = $_SESSION['username'] ?? 'Utilisateur';
 ?>
 <!DOCTYPE html>

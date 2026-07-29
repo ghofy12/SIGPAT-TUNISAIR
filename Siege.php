@@ -1,6 +1,7 @@
 <?php
 require_once 'config.php';
 if(!isLoggedIn()){ redirect('login.php'); }
+requireModuleAccess($pdo, 'siege');
 $username = $_SESSION['username'] ?? 'Utilisateur';
 
 $NORMES = [
@@ -21,17 +22,39 @@ $ETAGES = [
 ];
 
 $tous = [];
-try { $tous = $pdo->query("SELECT * FROM siege_bureaux ORDER BY etage ASC, ref_bureau ASC")->fetchAll(PDO::FETCH_ASSOC); }
-catch(Exception $e){}
+try {
+  // ── Utilise la vue siege_bureaux (bureaux + employes JOIN)
+  // pour avoir mle, l_fonct, l_entite, direction, etc.
+  $tous = $pdo->query("
+    SELECT * FROM siege_bureaux
+    ORDER BY etage ASC, ref_bureau ASC
+  ")->fetchAll(PDO::FETCH_ASSOC);
+} catch(Exception $e){}
 
 $by_etage = [];
 foreach($tous as $b) $by_etage[intval($b['etage'])][] = $b;
 
 $stats = [];
 foreach($ETAGES as $n=>$_){
-  $l=$by_etage[$n]??[]; $occ=count(array_filter($l,fn($b)=>!empty($b['mle'])));
-  $hn=count(array_filter($l,fn($b)=>!empty($b['l_fonct'])&&isset($NORMES[$b['l_fonct']])&&!empty($b['superficie'])&&(floatval($b['superficie'])-$NORMES[$b['l_fonct']])>2));
-  $stats[$n]=['total'=>count($l),'occupes'=>$occ,'libres'=>count($l)-$occ,'m2'=>array_sum(array_column($l,'superficie')),'hn'=>$hn];
+  $l = $by_etage[$n] ?? [];
+  // Occupé = mle renseigné OU statut = 'Occupé'
+  $occ = count(array_filter($l, fn($b) =>
+    !empty($b['mle']) || ($b['statut'] ?? '') === 'Occupé'
+  ));
+  // Hors norme : superficie réelle > norme + 2 m²
+  $hn = count(array_filter($l, fn($b) =>
+    !empty($b['l_fonct'])
+    && isset($NORMES[$b['l_fonct']])
+    && !empty($b['superficie'])
+    && (floatval($b['superficie']) - $NORMES[$b['l_fonct']]) > 2
+  ));
+  $stats[$n] = [
+    'total'   => count($l),
+    'occupes' => $occ,
+    'libres'  => count($l) - $occ,
+    'm2'      => array_sum(array_column($l, 'superficie')),
+    'hn'      => $hn,
+  ];
 }
 
 $total_hn = array_sum(array_column($stats,'hn'));

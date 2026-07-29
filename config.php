@@ -1,31 +1,25 @@
 <?php
-/**
- * Configuration Système TUNISAIR - Gestion du Patrimoine
- * Fichier: config.php
- */
-
-// ============================================
-// CONFIGURATION BASE DE DONNÉES
-// ============================================
 define('DB_HOST', 'localhost');
 define('DB_NAME', 'tunisair_patrimoine');
 define('DB_USER', 'root');
 define('DB_PASS', '');
 define('DB_CHARSET', 'utf8mb4');
-
 // ============================================
 // CONFIGURATION APPLICATION
 // ============================================
 define('APP_NAME', 'TUNISAIR - Gestion du Patrimoine');
 define('APP_VERSION', '1.0.0');
 define('BASE_URL', 'http://localhost/tunisair/');
-
+defined('ANTHROPIC_API_KEY') or define('ANTHROPIC_API_KEY', 'sk-ant-api03-...');
+defined('ML_EXTRACT_HOST')   or define('ML_EXTRACT_HOST',   'http://127.0.0.1:5055');
 // ============================================
 // CONFIGURATION UPLOADS
 // ============================================
 define('UPLOAD_DIR', __DIR__ . '/uploads/');
 define('MAX_FILE_SIZE', 5242880); // 5MB
 define('ALLOWED_EXTENSIONS', ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'jpg', 'jpeg', 'png']);
+define('POPPLER_BIN', 'C:\\Users\\HP\\Downloads\\Release-26.02.0-0\\poppler-26.02.0\\Library\\bin');
+define('PYTHON_BIN', 'C:\\Program Files\\Python313\\python.exe');
 
 // ============================================
 // CONNEXION PDO
@@ -168,15 +162,14 @@ function isAdmin() {
  */
 function logActivity($pdo, $userId, $action, $module, $referenceId = null, $details = null) {
     try {
-        $ip = $_SERVER['REMOTE_ADDR'] ?? null;
-        $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? null;
-        
+        // Structure réelle de la table logs_activite (sans reference_id/IP/user_agent) :
+        //   id, user_id, action, module, details, date_action
         $stmt = $pdo->prepare("
             INSERT INTO logs_activite 
-            (user_id, action, module, reference_id, details, adresse_ip, user_agent) 
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (user_id, action, module, details) 
+            VALUES (?, ?, ?, ?)
         ");
-        $stmt->execute([$userId, $action, $module, $referenceId, $details, $ip, $userAgent]);
+        $stmt->execute([$userId, $action, $module, $details]);
         return true;
     } catch(PDOException $e) {
         error_log("Erreur log : " . $e->getMessage());
@@ -307,6 +300,110 @@ function uploadFile($file, $module, $referenceId) {
     }
     
     return ['success' => false, 'error' => 'Erreur lors de la sauvegarde'];
+}
+
+// ============================================
+// FONCTIONS DE CONTRÔLE D'ACCÈS PAR PROFIL
+// ============================================
+
+/**
+ * Vérifie si le profil de l'utilisateur connecté a accès à un module
+ */
+function hasModuleAccess($pdo, $moduleCode) {
+    if (!isLoggedIn()) return false;
+    if (($_SESSION['role_id'] ?? '') === 'super_admin') return true;
+
+    try {
+        $stmt = $pdo->prepare("
+            SELECT COUNT(*) 
+            FROM role_permissions rp
+            JOIN roles r   ON r.id = rp.role_id
+            JOIN modules m ON m.id = rp.module_id
+            WHERE r.code = ?
+              AND m.code = ?
+              AND r.actif = 1
+              AND m.actif = 1
+        ");
+        $stmt->execute([$_SESSION['role_id'] ?? '', $moduleCode]);
+        return $stmt->fetchColumn() > 0;
+    } catch (PDOException $e) {
+        error_log("Erreur hasModuleAccess: " . $e->getMessage());
+        return false;
+    }
+}
+
+/**
+ * Vérifie si le profil a une permission précise sur un module
+ */
+function hasModulePermission($pdo, $moduleCode, $permissionCode) {
+    if (!isLoggedIn()) return false;
+    if (($_SESSION['role_id'] ?? '') === 'super_admin') return true;
+
+    try {
+        $stmt = $pdo->prepare("
+            SELECT COUNT(*) 
+            FROM role_permissions rp
+            JOIN roles r       ON r.id = rp.role_id
+            JOIN modules m     ON m.id = rp.module_id
+            JOIN permissions p ON p.id = rp.permission_id
+            WHERE r.code = ?
+              AND m.code = ?
+              AND p.code = ?
+              AND r.actif = 1
+              AND m.actif = 1
+        ");
+        $stmt->execute([$_SESSION['role_id'] ?? '', $moduleCode, $permissionCode]);
+        return $stmt->fetchColumn() > 0;
+    } catch (PDOException $e) {
+        error_log("Erreur hasModulePermission: " . $e->getMessage());
+        return false;
+    }
+}
+
+/**
+ * Bloque l'accès à la page si le profil n'a pas le module
+ */
+function requireModuleAccess($pdo, $moduleCode, $redirectUrl = 'dashboard.php') {
+    if (!hasModuleAccess($pdo, $moduleCode)) {
+        setFlashMessage('error', "Votre profil ne vous donne pas accès à ce module.");
+        redirect($redirectUrl);
+    }
+}
+
+/**
+ * Bloque l'accès si le profil n'a pas une permission précise
+ */
+function requireModulePermission($pdo, $moduleCode, $permissionCode, $redirectUrl = 'dashboard.php') {
+    if (!hasModulePermission($pdo, $moduleCode, $permissionCode)) {
+        setFlashMessage('error', "Votre profil ne vous autorise pas cette action.");
+        redirect($redirectUrl);
+    }
+}
+
+/**
+ * Retourne la liste des modules accessibles au profil courant
+ */
+function getAccessibleModulesForUser($pdo) {
+    if (!isLoggedIn()) return [];
+
+    try {
+        if (($_SESSION['role_id'] ?? '') === 'super_admin') {
+            return $pdo->query("SELECT * FROM modules WHERE actif = 1 ORDER BY ordre, nom")->fetchAll();
+        }
+
+        $stmt = $pdo->prepare("
+            SELECT DISTINCT m.*
+            FROM role_permissions rp
+            JOIN roles r   ON r.id = rp.role_id
+            JOIN modules m ON m.id = rp.module_id
+            WHERE r.code = ? AND r.actif = 1 AND m.actif = 1
+            ORDER BY m.ordre, m.nom
+        ");
+        $stmt->execute([$_SESSION['role_id'] ?? '']);
+        return $stmt->fetchAll();
+    } catch (PDOException $e) {
+        return [];
+    }
 }
 
 // ============================================

@@ -1,18 +1,31 @@
 <?php
 require_once 'config.php';
 if(!isLoggedIn()){ redirect('login.php'); }
+requireModuleAccess($pdo, 'concessions');
 $username = $_SESSION['username'] ?? 'Utilisateur';
 
+// ── Droits du profil courant sur ce module (pour affichage ET contrôle serveur) ──
+$canCreate = hasModulePermission($pdo, 'concessions', 'create');
+$canUpdate = hasModulePermission($pdo, 'concessions', 'update');
+$canDelete = hasModulePermission($pdo, 'concessions', 'delete');
+
+// Support filtering by airport (from concessions.php) OR by zone
+$filterAeroport = trim($_GET['aeroport'] ?? '');
 $zone  = $_GET['zone'] ?? 'Nationale';
 $isNat = $zone === 'Nationale';
 
-// Colonnes réelles : id, reference, aeroport, type_concession, surface,
-// date_debut, date_fin, montant_annuel, contrat_concession_pdf,
-// statut, date_creation, date_modification, zone_type
+/*
+  ALTER TABLE concessions
+    ADD COLUMN tva        DECIMAL(5,2)  DEFAULT NULL COMMENT 'Taux TVA en %',
+    ADD COLUMN bailleur   VARCHAR(120)  DEFAULT NULL COMMENT 'OACA / TAV Tunisie S.A. / etc.';
+*/
 
 // ── ADD ──
 if(isset($_POST['action']) && $_POST['action']==='add'){
-    $pdo->prepare("INSERT INTO concessions (reference,aeroport,type_concession,surface,date_debut,date_fin,montant_annuel,statut,zone_type) VALUES (?,?,?,?,?,?,?,?,?)")
+    requireModulePermission($pdo, 'concessions', 'create');
+    $pdo->prepare("INSERT INTO concessions
+        (reference,aeroport,type_concession,surface,date_debut,date_fin,montant_annuel,statut,zone_type,tva,bailleur)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)")
         ->execute([
             $_POST['reference']       ?? null,
             $_POST['aeroport']        ?? null,
@@ -23,6 +36,8 @@ if(isset($_POST['action']) && $_POST['action']==='add'){
             $_POST['montant_annuel']  ? (float)$_POST['montant_annuel'] : null,
             $_POST['statut']          ?? 'Active',
             $zone,
+            $_POST['tva']             !== '' ? (float)$_POST['tva'] : null,
+            trim($_POST['bailleur']   ?? '') ?: null,
         ]);
     $newId=$pdo->lastInsertId();
     if(!empty($_FILES['contrat_concession_pdf']['tmp_name'])){
@@ -31,12 +46,17 @@ if(isset($_POST['action']) && $_POST['action']==='add'){
         move_uploaded_file($_FILES['contrat_concession_pdf']['tmp_name'],$dir.$fname);
         $pdo->prepare("UPDATE concessions SET contrat_concession_pdf=? WHERE id=?")->execute([$dir.$fname,$newId]);
     }
-    header("Location: ?zone=".urlencode($zone)."&id=".$newId."&add_ok=1"); exit;
+    $redir = $filterAeroport ? '?aeroport='.urlencode($filterAeroport) : '?zone='.urlencode($zone);
+    header("Location: ".$redir."&id=".$newId."&add_ok=1"); exit;
 }
 
 // ── EDIT ──
 if(isset($_POST['action']) && $_POST['action']==='edit' && !empty($_POST['id'])){
-    $pdo->prepare("UPDATE concessions SET reference=?,aeroport=?,type_concession=?,surface=?,date_debut=?,date_fin=?,montant_annuel=?,statut=? WHERE id=?")
+    requireModulePermission($pdo, 'concessions', 'update');
+    $pdo->prepare("UPDATE concessions SET
+        reference=?,aeroport=?,type_concession=?,surface=?,date_debut=?,date_fin=?,
+        montant_annuel=?,statut=?,tva=?,bailleur=?
+        WHERE id=?")
         ->execute([
             $_POST['reference']       ?? null,
             $_POST['aeroport']        ?? null,
@@ -46,6 +66,8 @@ if(isset($_POST['action']) && $_POST['action']==='edit' && !empty($_POST['id']))
             $_POST['date_fin']        ?? null,
             $_POST['montant_annuel']  ? (float)$_POST['montant_annuel'] : null,
             $_POST['statut']          ?? 'Active',
+            $_POST['tva']             !== '' ? (float)$_POST['tva'] : null,
+            trim($_POST['bailleur']   ?? '') ?: null,
             (int)$_POST['id'],
         ]);
     if(!empty($_FILES['contrat_concession_pdf']['tmp_name'])){
@@ -54,25 +76,58 @@ if(isset($_POST['action']) && $_POST['action']==='edit' && !empty($_POST['id']))
         move_uploaded_file($_FILES['contrat_concession_pdf']['tmp_name'],$dir.$fname);
         $pdo->prepare("UPDATE concessions SET contrat_concession_pdf=? WHERE id=?")->execute([$dir.$fname,(int)$_POST['id']]);
     }
-    header("Location: ?zone=".urlencode($zone)."&id=".$_POST['id']); exit;
+    $redir2 = $filterAeroport ? '?aeroport='.urlencode($filterAeroport) : '?zone='.urlencode($zone);
+    header("Location: ".$redir2."&id=".$_POST['id']); exit;
 }
 
 // ── DELETE ──
 if(isset($_POST['action']) && $_POST['action']==='delete' && !empty($_POST['id'])){
+    requireModulePermission($pdo, 'concessions', 'delete');
     $pdo->prepare("DELETE FROM concessions WHERE id=?")->execute([(int)$_POST['id']]);
-    header("Location: ?zone=".urlencode($zone)); exit;
+    $redir3 = $filterAeroport ? '?aeroport='.urlencode($filterAeroport) : '?zone='.urlencode($zone);
+    header("Location: ".$redir3); exit;
 }
 
 // ── FETCH LIST ──
-$stmt=$pdo->prepare("SELECT * FROM concessions WHERE zone_type=? ORDER BY aeroport");
-$stmt->execute([$zone]); $concessions=$stmt->fetchAll();
+if($filterAeroport){
+    $stmt=$pdo->prepare("SELECT * FROM concessions WHERE aeroport=? ORDER BY reference");
+    $stmt->execute([$filterAeroport]);
+    // derive zone from first result
+    $concessions=$stmt->fetchAll();
+    if(!empty($concessions)){ $zone=$concessions[0]['zone_type']??'Nationale'; }
+    $isNat = $zone === 'Nationale';
+} else {
+    $stmt=$pdo->prepare("SELECT * FROM concessions WHERE zone_type=? ORDER BY aeroport, reference");
+    $stmt->execute([$zone]); $concessions=$stmt->fetchAll();
+}
 
+// Detect dominant bailleur for theming (OACA=red, TAV=blue)
+$dominantBailleur = '';
+foreach($concessions as $c){
+    $b = strtolower(trim($c['bailleur'] ?? ''));
+    if(strpos($b, 'oaca') !== false){ $dominantBailleur = 'oaca'; break; }
+    if(strpos($b, 'tav')  !== false){ $dominantBailleur = 'tav'; }
+}
+// Fallback: use zone_type
+if(!$dominantBailleur){
+    $dominantBailleur = $isNat ? 'oaca' : 'tav';
+}
+$isOacaTheme = ($dominantBailleur === 'oaca');
+
+// Stats
 $total=count($concessions); $actifs=0; $expiring=0; $superficie_total=0; $montant_total=0;
 foreach($concessions as $c){
     if(stripos($c['statut']??'','activ')!==false) $actifs++;
     $superficie_total += (float)($c['surface']??0);
     $montant_total    += (float)($c['montant_annuel']??0);
     if(!empty($c['date_fin'])){$d=(strtotime($c['date_fin'])-time())/86400;if($d>=0&&$d<=60)$expiring++;}
+}
+
+// Group by airport
+$grouped = [];
+foreach($concessions as $c){
+    $ap = trim($c['aeroport'] ?? '') ?: '—';
+    $grouped[$ap][] = $c;
 }
 
 // ── FETCH DETAIL ──
@@ -84,13 +139,14 @@ if($selectedId){
 }
 
 $statuts_list=['Active','Expirée','Suspendue'];
+$default_bailleur = $isOacaTheme ? 'OACA' : 'TAV Tunisie S.A.';
 ?>
 <!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Concessions — <?=htmlspecialchars($zone)?> · TUNISAIR</title>
+<title>Concessions — <?=htmlspecialchars($filterAeroport ?: $zone)?> · TUNISAIR</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -102,11 +158,11 @@ $statuts_list=['Active','Expirée','Suspendue'];
   --ink:#1A1A18;--muted:#6B7280;
   --bg:#F4F6F9;--white:#fff;
   --rule:rgba(0,0,0,.07);--shadow:0 4px 20px rgba(0,0,0,.07);
-  --accent:<?=$isNat?'var(--red)':'var(--navy-mid)'?>;
-  --accent-dark:<?=$isNat?'var(--red-dark)':'var(--navy)'?>;
-  --accent-glow:<?=$isNat?'rgba(200,16,46,.18)':'rgba(29,78,216,.16)'?>;
-  --green:#059669;--orange:#D97706;
-  --sidebar-w:270px;
+  --accent:<?=$isOacaTheme?'var(--red)':'var(--navy-mid)'?>;
+  --accent-dark:<?=$isOacaTheme?'var(--red-dark)':'var(--navy)'?>;
+  --accent-glow:<?=$isOacaTheme?'rgba(200,16,46,.18)':'rgba(29,78,216,.16)'?>;
+  --green:#059669;--orange:#D97706;--teal:#0891B2;
+  --sidebar-w:280px;
 }
 html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--ink);overflow:hidden;}
 .navbar{background:var(--white);border-bottom:3px solid var(--red);box-shadow:0 2px 10px rgba(0,0,0,.06);height:64px;padding:0 24px;display:flex;align-items:center;justify-content:space-between;position:fixed;top:0;left:0;right:0;z-index:200;}
@@ -118,76 +174,98 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
 .btn-deconnexion{background:var(--red);color:white;padding:7px 18px;border-radius:8px;text-decoration:none;font-size:12px;font-weight:600;transition:background .2s;}
 .btn-deconnexion:hover{background:var(--red-dark);}
 .layout{display:flex;height:calc(100vh - 64px);margin-top:64px;}
+
+/* ── SIDEBAR ── */
 .sidebar{width:var(--sidebar-w);flex-shrink:0;background:var(--white);border-right:1px solid var(--rule);display:flex;flex-direction:column;overflow:hidden;}
-.sidebar-top{padding:16px 14px;border-bottom:1px solid var(--rule);flex-shrink:0;}
-.btn-retour{display:flex;align-items:center;gap:7px;padding:8px 12px;border-radius:8px;border:1.5px solid var(--rule);background:var(--bg);color:var(--muted);text-decoration:none;font-size:12px;font-weight:600;transition:all .18s;width:100%;margin-bottom:10px;cursor:pointer;}
+.sidebar-top{padding:14px 12px;border-bottom:1px solid var(--rule);flex-shrink:0;display:flex;flex-direction:column;gap:8px;}
+.btn-retour{display:flex;align-items:center;gap:7px;padding:8px 12px;border-radius:8px;border:1.5px solid var(--rule);background:var(--bg);color:var(--muted);text-decoration:none;font-size:12px;font-weight:600;transition:all .18s;width:100%;cursor:pointer;}
 .btn-retour:hover{background:var(--white);border-color:var(--accent);color:var(--accent);}
 .btn-add{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:10px 14px;border-radius:10px;background:var(--accent);color:white;border:none;cursor:pointer;font-size:13px;font-weight:600;font-family:'DM Sans',sans-serif;box-shadow:0 3px 12px var(--accent-glow);transition:opacity .2s,transform .15s;}
 .btn-add:hover{opacity:.9;transform:translateY(-1px);}
-.sidebar-search{padding:10px 14px;border-bottom:1px solid var(--rule);flex-shrink:0;}
+.sidebar-search{padding:8px 12px;border-bottom:1px solid var(--rule);flex-shrink:0;}
+.sidebar-search-wrap{position:relative;}
 .sidebar-search-input{width:100%;padding:8px 12px 8px 32px;border-radius:8px;border:1.5px solid var(--rule);background:var(--bg);font-family:'DM Sans',sans-serif;font-size:12px;color:var(--ink);outline:none;transition:border-color .2s;}
 .sidebar-search-input:focus{border-color:var(--accent);}
-.sidebar-search-wrap{position:relative;}
 .sidebar-search-icon{position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--muted);pointer-events:none;}
-.sidebar-label{padding:10px 16px 6px;font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);flex-shrink:0;}
-.sidebar-list{flex:1;overflow-y:auto;padding:4px 10px 10px;}
+.sidebar-list{flex:1;overflow-y:auto;padding:6px 8px 12px;}
 .sidebar-list::-webkit-scrollbar{width:4px;}
 .sidebar-list::-webkit-scrollbar-thumb{background:#D1D5DB;border-radius:2px;}
-.conc-item{display:flex;align-items:center;gap:10px;padding:10px;border-radius:10px;cursor:pointer;transition:background .15s;margin-bottom:3px;}
+
+/* Airport group */
+.airport-group{margin-bottom:6px;}
+.airport-group-header{display:flex;align-items:center;justify-content:space-between;padding:8px 10px 4px;cursor:pointer;border-radius:8px;transition:background .12s;user-select:none;}
+.airport-group-header:hover{background:var(--bg);}
+.airport-group-name{font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);}
+.airport-group-count{font-size:10px;font-weight:700;color:white;background:var(--accent);border-radius:20px;padding:2px 7px;min-width:20px;text-align:center;}
+.airport-group-body{padding:0 0 4px;}
+.airport-group.collapsed .airport-group-body{display:none;}
+.airport-group-chevron{transition:transform .2s;color:var(--muted);}
+.airport-group.collapsed .airport-group-chevron{transform:rotate(-90deg);}
+
+.conc-item{display:flex;align-items:center;gap:9px;padding:9px 10px;border-radius:10px;cursor:pointer;transition:background .15s;margin-bottom:2px;}
 .conc-item:hover{background:var(--bg);}
 .conc-item.active{background:linear-gradient(135deg,var(--accent-dark),var(--accent));box-shadow:0 3px 12px var(--accent-glow);}
-.conc-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;background:#D1D5DB;}
+.conc-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;background:#D1D5DB;}
 .conc-item.active .conc-dot{background:rgba(255,255,255,.6);}
 .conc-item-body{flex:1;min-width:0;}
 .conc-name{font-size:12px;font-weight:600;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .conc-item.active .conc-name{color:white;}
-.conc-meta{font-size:10px;color:var(--muted);margin-top:2px;}
+.conc-meta{font-size:10px;color:var(--muted);margin-top:1px;}
 .conc-item.active .conc-meta{color:rgba(255,255,255,.7);}
-.conc-num{font-size:10px;font-weight:700;color:var(--muted);flex-shrink:0;width:18px;text-align:right;}
-.conc-item.active .conc-num{color:rgba(255,255,255,.6);}
 .conc-status-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;margin-left:2px;}
+
+/* ── MAIN ── */
 .main{flex:1;display:flex;flex-direction:column;overflow:hidden;}
-.stats-bar{display:flex;gap:12px;padding:16px 20px;background:var(--white);border-bottom:1px solid var(--rule);flex-shrink:0;}
-.stat-card{flex:1;background:var(--bg);border-radius:12px;padding:14px 16px;border-left:3px solid var(--accent);}
+.stats-bar{display:flex;gap:10px;padding:14px 20px;background:var(--white);border-bottom:1px solid var(--rule);flex-shrink:0;}
+.stat-card{flex:1;background:var(--bg);border-radius:12px;padding:12px 14px;border-left:3px solid var(--accent);}
 .stat-card.green{border-left-color:var(--green);}
 .stat-card.orange{border-left-color:var(--orange);}
-.stat-label{font-size:9px;font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:var(--muted);margin-bottom:6px;}
-.stat-value{font-size:22px;font-weight:700;color:var(--ink);}
+.stat-card.teal{border-left-color:var(--teal);}
+.stat-label{font-size:9px;font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:var(--muted);margin-bottom:5px;}
+.stat-value{font-size:20px;font-weight:700;color:var(--ink);}
 .stat-value.accent{color:var(--accent);}
-.stat-sub{font-size:10px;color:var(--muted);margin-top:3px;}
-.content-area{flex:1;overflow-y:auto;padding:24px;}
+.stat-sub{font-size:10px;color:var(--muted);margin-top:2px;}
+.content-area{flex:1;overflow-y:auto;padding:22px;}
 .content-area::-webkit-scrollbar{width:6px;}
 .content-area::-webkit-scrollbar-thumb{background:#D1D5DB;border-radius:3px;}
-.empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:var(--muted);text-align:center;animation:fadeIn .3s ease;}
-@keyframes fadeIn{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:none;}}
+.empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:var(--muted);text-align:center;}
 .empty-icon{width:80px;height:80px;border-radius:20px;background:var(--white);display:flex;align-items:center;justify-content:center;border:2px dashed #D1D5DB;margin-bottom:18px;}
 .empty-state h3{font-size:17px;font-weight:700;color:var(--ink);margin-bottom:7px;}
 .empty-state p{font-size:13px;max-width:280px;line-height:1.6;}
+
+/* ── DETAIL ── */
 .detail{animation:slideIn .28s cubic-bezier(.22,.68,0,1.1);}
 @keyframes slideIn{from{opacity:0;transform:translateX(14px);}to{opacity:1;transform:none;}}
-.detail-header{background:linear-gradient(135deg,var(--accent-dark),var(--accent));border-radius:16px;padding:22px 24px;margin-bottom:18px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px;}
+.detail-header{background:linear-gradient(135deg,var(--accent-dark),var(--accent));border-radius:16px;padding:20px 22px;margin-bottom:16px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px;}
 .detail-header-info{flex:1;}
-.detail-badge-row{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
+.detail-badge-row{display:flex;align-items:center;gap:8px;margin-bottom:7px;}
 .detail-zone-tag{font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:rgba(255,255,255,.7);}
 .detail-titre{font-size:18px;font-weight:700;color:white;line-height:1.35;}
-.detail-ref{font-size:12px;color:rgba(255,255,255,.65);margin-top:5px;}
+.detail-ref{font-size:12px;color:rgba(255,255,255,.65);margin-top:4px;}
+.detail-bailleur-tag{display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,.18);color:white;font-size:10px;font-weight:700;padding:3px 10px;border-radius:20px;letter-spacing:.06em;}
 .detail-header-actions{display:flex;gap:8px;flex-shrink:0;}
 .hbtn{display:flex;align-items:center;gap:6px;padding:8px 14px;border-radius:9px;font-size:12px;font-weight:600;cursor:pointer;border:none;font-family:'DM Sans',sans-serif;transition:all .15s;}
 .hbtn-edit{background:rgba(255,255,255,.2);color:white;border:1.5px solid rgba(255,255,255,.3);}
 .hbtn-edit:hover{background:rgba(255,255,255,.3);}
 .hbtn-del{background:rgba(0,0,0,.2);color:white;border:1.5px solid rgba(0,0,0,.15);}
 .hbtn-del:hover{background:rgba(0,0,0,.3);}
-.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px;}
+.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:13px;margin-bottom:16px;}
 .detail-section{font-size:9px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--accent);margin-bottom:10px;padding-bottom:6px;border-bottom:2px solid var(--accent);display:block;}
 .d-card{background:var(--white);border-radius:12px;border:1px solid var(--rule);padding:16px 18px;box-shadow:0 2px 8px rgba(0,0,0,.04);}
 .d-card.full{grid-column:1/-1;}
 .d-card.hl{border-left:3px solid var(--accent);}
+.d-card.teal-hl{border-left:3px solid var(--teal);}
 .d-field-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.d-field-grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;}
 .d-field{padding:10px 12px;background:var(--bg);border-radius:8px;border:1px solid var(--rule);}
 .d-field.hl-field{border-left:3px solid var(--accent);}
+.d-field.teal-field{border-left:3px solid var(--teal);}
+.d-field.green-field{border-left:3px solid var(--green);}
 .d-label{font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:4px;}
 .d-value{font-size:13px;font-weight:600;color:var(--ink);}
 .d-value.big{font-size:16px;color:var(--accent);}
+.d-value.teal{font-size:15px;color:var(--teal);}
+.d-value.green{font-size:15px;color:var(--green);}
 .statut-badge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:600;}
 .badge-active{background:#DCFCE7;color:#15803D;}
 .badge-expiree{background:#FEE2E2;color:#DC2626;}
@@ -216,7 +294,7 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
 /* Modals */
 .modal-bg{display:none;position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.55);backdrop-filter:blur(5px);align-items:center;justify-content:center;padding:24px;}
 .modal-bg.open{display:flex;}
-.edit-inner{background:var(--bg);border-radius:18px;width:min(720px,96vw);max-height:90vh;overflow-y:auto;padding:32px;box-shadow:0 32px 80px rgba(0,0,0,.18);}
+.edit-inner{background:var(--bg);border-radius:18px;width:min(740px,96vw);max-height:90vh;overflow-y:auto;padding:32px;box-shadow:0 32px 80px rgba(0,0,0,.18);}
 .edit-inner h2{font-size:14px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--ink);margin-bottom:6px;}
 .modal-sub{font-size:12px;color:var(--muted);margin-bottom:24px;}
 .modal-section{font-size:10px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--accent);margin:20px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--rule);}
@@ -226,31 +304,34 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
 .form-label{font-size:10px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);}
 .form-input{padding:10px 14px;border-radius:9px;border:1.5px solid var(--rule);background:white;font-family:'DM Sans',sans-serif;font-size:14px;color:var(--ink);outline:none;transition:border-color .2s,box-shadow .2s;}
 .form-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-glow);}
+.form-hint{font-size:10px;color:var(--muted);}
 .form-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:24px;}
 .del-inner{background:white;border-radius:16px;padding:32px 36px;width:min(400px,92vw);text-align:center;box-shadow:0 24px 60px rgba(0,0,0,.18);}
 .del-inner h3{font-size:14px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;margin-bottom:12px;}
 .del-inner p{font-size:13.5px;color:var(--muted);margin-bottom:24px;line-height:1.6;}
-.del-actions{display:flex;gap:10px;justify-content:center;}
-.btn{display:inline-flex;align-items:center;gap:7px;padding:9px 18px;border-radius:9px;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none;border:none;font-family:'DM Sans',sans-serif;transition:transform .2s,background .15s;}
-.btn:hover{transform:translateY(-2px);}
-.btn-primary{background:var(--accent);color:white;box-shadow:0 4px 14px var(--accent-glow);}
-.btn-ghost{background:var(--white);color:var(--ink);border:1.5px solid var(--rule);}
-.btn-ghost:hover{background:var(--bg);}
-.btn-danger{background:#FEF2F2;color:#DC2626;border:1.5px solid #FECACA;}
-.btn-danger:hover{background:#FEE2E2;}
-.pdf-inner{background:white;border-radius:18px;width:min(900px,95vw);height:85vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 32px 80px rgba(0,0,0,.22);}
-.modal-head{display:flex;align-items:center;justify-content:space-between;padding:16px 22px;border-bottom:1px solid var(--rule);}
-.modal-head-title{font-size:12px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;}
-.modal-close{width:32px;height:32px;border-radius:8px;border:1px solid var(--rule);background:var(--bg);cursor:pointer;display:grid;place-items:center;}
+.del-actions{display:flex;gap:12px;justify-content:center;}
+.pdf-inner{background:var(--bg);border-radius:16px;width:min(900px,95vw);height:85vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 32px 80px rgba(0,0,0,.22);}
+.modal-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--rule);background:var(--white);border-radius:16px 16px 0 0;}
+.modal-head-title{font-size:13px;font-weight:700;color:var(--ink);}
+.modal-close{width:30px;height:30px;border-radius:8px;background:var(--bg);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--muted);transition:background .15s;}
 .modal-close:hover{background:#E5E7EB;}
-.pdf-frame{flex:1;border:none;width:100%;}
-.toast{position:fixed;top:76px;right:24px;z-index:900;background:#ECFDF5;color:#065F46;border:1.5px solid #A7F3D0;border-radius:12px;padding:12px 20px;font-size:13px;font-weight:600;display:flex;align-items:center;gap:10px;box-shadow:0 6px 24px rgba(0,0,0,.12);animation:toastIn .3s ease;}
-@keyframes toastIn{from{opacity:0;transform:translateX(20px);}to{opacity:1;transform:none;}}
-@media(max-width:700px){.detail-grid{grid-template-columns:1fr;}.stats-bar{flex-wrap:wrap;}.stat-card{min-width:calc(50% - 6px);}}
+.pdf-frame{flex:1;border:none;background:white;}
+.btn{padding:10px 20px;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s;}
+.btn-primary{background:var(--accent);color:white;display:flex;align-items:center;gap:7px;box-shadow:0 3px 10px var(--accent-glow);}
+.btn-primary:hover{opacity:.9;transform:translateY(-1px);}
+.btn-ghost{background:transparent;color:var(--muted);border:1.5px solid var(--rule);}
+.btn-ghost:hover{background:var(--bg);}
+.btn-danger{background:#DC2626;color:white;}
+.btn-danger:hover{background:#B91C1C;}
+/* TVA preview */
+.tva-preview{display:none;background:linear-gradient(135deg,rgba(8,145,178,.08),rgba(8,145,178,.04));border:1px solid rgba(8,145,178,.2);border-radius:10px;padding:12px 14px;margin-top:8px;grid-column:1/-1;}
+.tva-preview.visible{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;}
+.tva-prev-item{text-align:center;}
+.tva-prev-label{font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--teal);margin-bottom:4px;}
+.tva-prev-val{font-size:14px;font-weight:700;color:var(--ink);}
 </style>
 </head>
 <body>
-
 <nav class="navbar">
   <a href="index.php" class="nav-brand">
     <img src="logo.webp" alt="TUNISAIR" class="nav-logo">
@@ -262,157 +343,224 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
   </div>
 </nav>
 
-<?php if(isset($_GET['add_ok'])): ?>
-<div class="toast" id="toast">
-  <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" stroke="#059669" stroke-width="1.4"/><path d="M5 8l2.5 2.5L11 5.5" stroke="#059669" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-  Concession ajoutée avec succès !
-</div>
-<script>setTimeout(()=>document.getElementById('toast')?.remove(),3500);</script>
-<?php endif; ?>
-
 <div class="layout">
-
-  <!-- SIDEBAR -->
+  <!-- ══ SIDEBAR ══ -->
   <aside class="sidebar">
     <div class="sidebar-top">
       <a href="concessions.php" class="btn-retour">
-        <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M10 3L5 8l5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        Retour aux concessions
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M10 3L5 8l5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Retour aux aéroports
       </a>
+      <?php if($filterAeroport): ?>
+      <div style="padding:8px 12px;background:var(--accent-glow, rgba(200,16,46,.08));border-radius:10px;border-left:3px solid var(--accent);">
+        <div style="font-size:9px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin-bottom:3px;">Aéroport sélectionné</div>
+        <div style="font-size:13px;font-weight:700;color:var(--ink);"><?=htmlspecialchars($filterAeroport)?></div>
+        <?php if(!empty($concessions[0]['bailleur'])): ?>
+        <div style="font-size:10px;font-weight:600;color:var(--muted);margin-top:2px;"><?=htmlspecialchars($concessions[0]['bailleur']??'')?></div>
+        <?php endif; ?>
+      </div>
+      <?php endif; ?>
+      <?php if($canCreate): ?>
       <button class="btn-add" onclick="document.getElementById('addModal').classList.add('open')">
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M8 2v12M2 8h12" stroke="white" stroke-width="2" stroke-linecap="round"/></svg>
-        Ajouter une concession
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 2v12M2 8h12" stroke="white" stroke-width="2" stroke-linecap="round"/></svg>
+        Nouvelle concession
       </button>
+      <?php endif; ?>
     </div>
+
     <div class="sidebar-search">
       <div class="sidebar-search-wrap">
-        <span class="sidebar-search-icon">
-          <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="6.5" cy="6.5" r="4.5" stroke="currentColor" stroke-width="1.4"/><path d="M10 10l3.5 3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-        </span>
-        <input type="text" class="sidebar-search-input" id="sideSearch" placeholder="Rechercher…" oninput="filterSidebar(this.value)">
+        <svg class="sidebar-search-icon" width="13" height="13" viewBox="0 0 16 16" fill="none"><circle cx="6.5" cy="6.5" r="4.5" stroke="#9CA3AF" stroke-width="1.5"/><path d="M10 10l3.5 3.5" stroke="#9CA3AF" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <input class="sidebar-search-input" type="text" placeholder="Rechercher…" oninput="filterSidebar(this.value)" id="searchInput">
       </div>
     </div>
-    <div class="sidebar-label">PORTEFEUILLE (<?=$total?>)</div>
+
     <div class="sidebar-list" id="sidebarList">
-      <?php foreach($concessions as $i=>$c):
-        $s=strtolower($c['statut']??'');
-        $dotColor = str_contains($s,'activ')?'#22C55E':(str_contains($s,'expir')?'#EF4444':'#F59E0B');
-        $cJson = htmlspecialchars(json_encode($c), ENT_QUOTES);
-      ?>
-      <div class="conc-item <?=$selectedId===$c['id']?'active':''?>"
-           data-id="<?=$c['id']?>"
-           data-search="<?=htmlspecialchars(strtolower(($c['aeroport']??'').' '.($c['reference']??'').' '.($c['type_concession']??'')))?>"
-           onclick="selectConc(<?=$cJson?>)">
-        <div class="conc-dot"></div>
-        <div class="conc-item-body">
-          <div class="conc-name"><?=htmlspecialchars($c['aeroport']??'—')?></div>
-          <div class="conc-meta">
-            <?=htmlspecialchars($c['reference']??'')?>
-            <?php if(!empty($c['montant_annuel'])): ?>· <?=number_format((float)$c['montant_annuel'],0,',',' ')?> TND/an<?php endif; ?>
+      <?php foreach($grouped as $airport => $items): ?>
+      <div class="airport-group" data-airport="<?=htmlspecialchars($airport)?>">
+        <div class="airport-group-header" onclick="toggleGroup(this.parentElement)">
+          <span class="airport-group-name">
+            <?= $isOacaTheme ? '🇹🇳 ' : '🌍 ' ?><?=htmlspecialchars($airport)?>
+          </span>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span class="airport-group-count"><?=count($items)?></span>
+            <svg class="airport-group-chevron" width="10" height="10" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </div>
         </div>
-        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;">
-          <div class="conc-num"><?=str_pad($i+1,2,'0',STR_PAD_LEFT)?></div>
-          <div class="conc-status-dot" style="background:<?=$dotColor?>;"></div>
+        <div class="airport-group-body">
+          <?php foreach($items as $c):
+            $s=strtolower($c['statut']??'');
+            $dotColor=$s==='' ? '#D1D5DB' : ($s[0]==='a'?'#22C55E':($s[0]==='e'?'#EF4444':'#F59E0B'));
+            $searchKey = strtolower(($c['aeroport']??'').' '.($c['reference']??'').' '.($c['type_concession']??'').' '.($c['bailleur']??''));
+          ?>
+          <div class="conc-item <?=$c['id']===$selectedId?'active':''?>"
+               data-id="<?=$c['id']?>"
+               data-search="<?=htmlspecialchars($searchKey)?>"
+               onclick="selectConc(<?=htmlspecialchars(json_encode($c),ENT_QUOTES)?>)">
+            <div class="conc-dot"></div>
+            <div class="conc-item-body">
+              <div class="conc-name"><?=htmlspecialchars($c['type_concession'] ?: ($c['reference'] ?: 'Sans titre'))?></div>
+              <div class="conc-meta"><?=htmlspecialchars($c['reference']?:'')?><?= $c['bailleur'] ? ' · '.$c['bailleur'] : ''?></div>
+            </div>
+            <div class="conc-status-dot" style="background:<?=$dotColor?>"></div>
+          </div>
+          <?php endforeach; ?>
         </div>
       </div>
       <?php endforeach; ?>
+
+      <?php if(empty($concessions)): ?>
+      <div style="text-align:center;padding:32px 16px;color:var(--muted);font-size:12px;">
+        Aucune concession.<br>Cliquez sur «&nbsp;+ Nouvelle&nbsp;» pour commencer.
+      </div>
+      <?php endif; ?>
     </div>
   </aside>
 
-  <!-- MAIN -->
-  <main class="main">
+  <!-- ══ MAIN ══ -->
+  <div class="main">
+    <!-- Stats bar -->
     <div class="stats-bar">
       <div class="stat-card">
-        <div class="stat-label">Total Concessions</div>
+        <div class="stat-label">Total</div>
         <div class="stat-value accent"><?=$total?></div>
-        <div class="stat-sub"><?=$zone?></div>
+        <div class="stat-sub"><?=count($grouped)?> aéroport<?=count($grouped)>1?'s':''?></div>
       </div>
       <div class="stat-card green">
         <div class="stat-label">Actives</div>
         <div class="stat-value"><?=$actifs?></div>
-        <div class="stat-sub">concessions actives</div>
+        <div class="stat-sub"><?=$total-$actifs?> non actives</div>
       </div>
       <div class="stat-card orange">
         <div class="stat-label">Expirent bientôt</div>
         <div class="stat-value"><?=$expiring?></div>
-        <div class="stat-sub">dans 60 jours</div>
+        <div class="stat-sub">Dans les 60 jours</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Superficie</div>
-        <div class="stat-value"><?=number_format($superficie_total,0,',',' ')?></div>
-        <div class="stat-sub">m² total</div>
+        <div class="stat-label">Superficie totale</div>
+        <div class="stat-value"><?=number_format($superficie_total,0,'.',',')?></div>
+        <div class="stat-sub">m²</div>
       </div>
-      <div class="stat-card">
-        <div class="stat-label">Budget Annuel</div>
-        <div class="stat-value accent"><?=number_format($montant_total,0,',',' ')?></div>
-        <div class="stat-sub">TND</div>
+      <div class="stat-card teal">
+        <div class="stat-label">Montant HT total</div>
+        <div class="stat-value" style="font-size:15px;"><?=number_format($montant_total,0,'.',' ')?></div>
+        <div class="stat-sub">TND / an</div>
       </div>
     </div>
 
+    <!-- Content -->
     <div class="content-area" id="contentArea">
 
+      <!-- Empty state -->
       <div class="empty-state" id="emptyState" style="<?=$selectedId?'display:none':''?>">
         <div class="empty-icon">
-          <svg width="32" height="32" viewBox="0 0 24 24" fill="none"><path d="M3 21h18M9 21V7l7-4v18" stroke="#9CA3AF" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 11h7M9 15h7" stroke="#9CA3AF" stroke-width="1.3" stroke-linecap="round"/></svg>
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none"><path d="M3 21h18M9 21V7l7-4v18" stroke="#D1D5DB" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 11h7M9 15h7" stroke="#D1D5DB" stroke-width="1.3" stroke-linecap="round"/></svg>
         </div>
         <h3>Sélectionnez une concession</h3>
-        <p>Choisissez un aéroport dans la liste à gauche pour afficher sa fiche.</p>
+        <p>Cliquez sur une concession dans la liste à gauche pour voir ses détails.</p>
       </div>
 
-      <div class="detail" id="detailPanel" style="display:none;">
+      <!-- Detail panel -->
+      <div id="detailPanel" style="<?=$selectedId?'':'display:none'?>">
 
+        <!-- Header -->
         <div class="detail-header">
           <div class="detail-header-info">
             <div class="detail-badge-row">
               <span class="detail-zone-tag"><?=htmlspecialchars($zone)?></span>
-              <span class="statut-badge" id="dp_statut_badge">—</span>
+              <span class="statut-badge badge-other" id="dp_statut_badge">—</span>
             </div>
             <div class="detail-titre" id="dp_aeroport">—</div>
             <div class="detail-ref" id="dp_ref"></div>
+            <div style="margin-top:8px;" id="dp_bailleur_wrap"></div>
           </div>
           <div class="detail-header-actions">
+            <?php if($canUpdate): ?>
             <button class="hbtn hbtn-edit" id="dp_edit_btn">
-              <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M11.5 2.5a1.414 1.414 0 0 1 2 2L5 13H3v-2L11.5 2.5z" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M11.5 2.5l2 2-9 9H2.5v-2l9-9z" stroke="white" stroke-width="1.4" stroke-linejoin="round"/></svg>
               Modifier
             </button>
+            <?php endif; ?>
+            <?php if($canDelete): ?>
             <button class="hbtn hbtn-del" id="dp_del_btn">
-              <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M2 4h12M5 4V3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1M6 7v5M10 7v5M3 4l1 9a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1l1-9" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6 4V2h4v2M5 4v9a1 1 0 001 1h4a1 1 0 001-1V4" stroke="white" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
               Supprimer
             </button>
+            <?php endif; ?>
           </div>
         </div>
 
+        <!-- Grid -->
         <div class="detail-grid">
 
-          <div class="d-card">
-            <span class="detail-section">Occupation Domaniale</span>
-            <div class="d-field-grid">
-              <div class="d-field"><div class="d-label">Type de concession</div><div class="d-value" id="dp_type_concession">—</div></div>
-              <div class="d-field"><div class="d-label">Surface</div><div class="d-value" id="dp_surface">—</div></div>
-              <div class="d-field" style="grid-column:1/-1"><div class="d-label">Référence</div><div class="d-value" id="dp_reference">—</div></div>
-            </div>
-          </div>
-
+          <!-- Infos générales -->
           <div class="d-card hl">
-            <span class="detail-section">Finances</span>
+            <span class="detail-section">Informations générales</span>
             <div class="d-field-grid">
-              <div class="d-field hl-field" style="grid-column:1/-1"><div class="d-label">Montant annuel</div><div class="d-value big" id="dp_annuel">—</div></div>
-              <div class="d-field"><div class="d-label">Date début</div><div class="d-value" id="dp_debut">—</div></div>
-              <div class="d-field"><div class="d-label">Date fin</div><div class="d-value" id="dp_fin">—</div></div>
+              <div class="d-field">
+                <div class="d-label">Type de concession</div>
+                <div class="d-value" id="dp_type_concession">—</div>
+              </div>
+              <div class="d-field">
+                <div class="d-label">Superficie</div>
+                <div class="d-value" id="dp_surface">—</div>
+              </div>
+              <div class="d-field">
+                <div class="d-label">Référence</div>
+                <div class="d-value" id="dp_reference">—</div>
+              </div>
+              <div class="d-field">
+                <div class="d-label">Bailleur</div>
+                <div class="d-value" id="dp_bailleur">—</div>
+              </div>
             </div>
           </div>
 
-          <div class="d-card full">
-            <span class="detail-section">Durée du Contrat</span>
-            <div class="progress-wrap" style="margin-top:0;">
+          <!-- Durée -->
+          <div class="d-card">
+            <span class="detail-section">Durée du contrat</span>
+            <div class="d-field-grid">
+              <div class="d-field">
+                <div class="d-label">Date de début</div>
+                <div class="d-value" id="dp_debut">—</div>
+              </div>
+              <div class="d-field">
+                <div class="d-label">Date de fin</div>
+                <div class="d-value" id="dp_fin">—</div>
+              </div>
+            </div>
+            <div class="progress-wrap">
               <div class="progress-bar"><div class="progress-fill" id="dp_progress" style="width:0%"></div></div>
-              <div class="progress-txt" id="dp_progress_txt"></div>
+              <div class="progress-txt" id="dp_progress_txt">—</div>
             </div>
           </div>
 
+          <!-- Financier (TVA) — full width -->
+          <div class="d-card full teal-hl">
+            <span class="detail-section" style="color:var(--teal);border-bottom-color:var(--teal);">Informations financières</span>
+            <div class="d-field-grid-3">
+              <div class="d-field hl-field">
+                <div class="d-label">Montant annuel HT</div>
+                <div class="d-value big" id="dp_annuel">—</div>
+              </div>
+              <div class="d-field teal-field">
+                <div class="d-label">Taux TVA</div>
+                <div class="d-value teal" id="dp_tva_rate">—</div>
+              </div>
+              <div class="d-field teal-field">
+                <div class="d-label">Montant TVA</div>
+                <div class="d-value teal" id="dp_tva_amount">—</div>
+              </div>
+              <div class="d-field green-field" style="grid-column:1/-1;">
+                <div class="d-label">Montant annuel TTC</div>
+                <div class="d-value green" id="dp_ttc">—</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Documents -->
           <div class="d-card full">
-            <span class="detail-section">Document PDF — Contrat de Concession</span>
+            <span class="detail-section">Documents contractuels</span>
             <div class="pdf-row" id="dp_docs"></div>
             <div id="dp_upload_forms"></div>
           </div>
@@ -420,7 +568,7 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
         </div>
       </div>
     </div>
-  </main>
+  </div>
 </div>
 
 <!-- PDF MODAL -->
@@ -445,11 +593,13 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
     <form method="post" enctype="multipart/form-data">
       <input type="hidden" name="action" value="edit">
       <input type="hidden" name="id" id="edit_id" value="<?=$conc['id']?>">
-      <div class="modal-section">Informations</div>
+
+      <div class="modal-section">Localisation</div>
       <div class="form-grid">
         <div class="form-group full"><label class="form-label">Aéroport *</label><input class="form-input" type="text" name="aeroport" id="edit_aeroport" value="<?=htmlspecialchars($conc['aeroport']??'')?>" required></div>
         <div class="form-group"><label class="form-label">Référence</label><input class="form-input" type="text" name="reference" id="edit_reference" value="<?=htmlspecialchars($conc['reference']??'')?>"></div>
         <div class="form-group"><label class="form-label">Type de concession</label><input class="form-input" type="text" name="type_concession" id="edit_type_concession" value="<?=htmlspecialchars($conc['type_concession']??'')?>"></div>
+        <div class="form-group"><label class="form-label">Bailleur</label><input class="form-input" type="text" name="bailleur" id="edit_bailleur" value="<?=htmlspecialchars($conc['bailleur']??'')?>" placeholder="<?=$default_bailleur?>"></div>
         <div class="form-group"><label class="form-label">Surface (m²)</label><input class="form-input" type="number" step="0.01" name="surface" id="edit_surface" value="<?=htmlspecialchars($conc['surface']??'')?>"></div>
         <div class="form-group"><label class="form-label">Statut</label>
           <select class="form-input" name="statut" id="edit_statut">
@@ -458,9 +608,20 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
         </div>
         <div class="form-group"><label class="form-label">Date de début</label><input class="form-input" type="date" name="date_debut" id="edit_date_debut" value="<?=htmlspecialchars($conc['date_debut']??'')?>"></div>
         <div class="form-group"><label class="form-label">Date de fin</label><input class="form-input" type="date" name="date_fin" id="edit_date_fin" value="<?=htmlspecialchars($conc['date_fin']??'')?>"></div>
-        <div class="form-group"><label class="form-label">Montant annuel (TND)</label><input class="form-input" type="number" step="0.01" name="montant_annuel" id="edit_montant_annuel" value="<?=htmlspecialchars($conc['montant_annuel']??'')?>"></div>
+      </div>
+
+      <div class="modal-section">Financier</div>
+      <div class="form-grid">
+        <div class="form-group"><label class="form-label">Montant annuel HT (TND)</label><input class="form-input" type="number" step="0.01" name="montant_annuel" id="edit_montant_annuel" value="<?=htmlspecialchars($conc['montant_annuel']??'')?>" oninput="calcTvaPreview('edit')"></div>
+        <div class="form-group"><label class="form-label">Taux TVA (%)</label><input class="form-input" type="number" step="0.01" min="0" max="100" name="tva" id="edit_tva" value="<?=htmlspecialchars($conc['tva']??'')?>" placeholder="ex : 19" oninput="calcTvaPreview('edit')"><span class="form-hint">Laisser vide si exonéré</span></div>
+        <div class="tva-preview" id="edit_tva_preview">
+          <div class="tva-prev-item"><div class="tva-prev-label">HT</div><div class="tva-prev-val" id="edit_prev_ht">—</div></div>
+          <div class="tva-prev-item"><div class="tva-prev-label">TVA</div><div class="tva-prev-val" id="edit_prev_tva">—</div></div>
+          <div class="tva-prev-item"><div class="tva-prev-label">TTC</div><div class="tva-prev-val" id="edit_prev_ttc">—</div></div>
+        </div>
         <div class="form-group"><label class="form-label">Contrat PDF</label><input class="form-input" type="file" name="contrat_concession_pdf" accept=".pdf" style="padding:7px 12px;"></div>
       </div>
+
       <div class="form-actions">
         <button type="button" class="btn btn-ghost" onclick="document.getElementById('editModal').classList.remove('open')">Annuler</button>
         <button type="submit" class="btn btn-primary">Enregistrer</button>
@@ -493,10 +654,20 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
     <p class="modal-sub">Seul le champ Aéroport est obligatoire.</p>
     <form method="post" enctype="multipart/form-data">
       <input type="hidden" name="action" value="add">
+
+      <div class="modal-section">Localisation</div>
       <div class="form-grid">
+        <?php if($filterAeroport): ?>
+        <div class="form-group full">
+          <label class="form-label">Aéroport *</label>
+          <input class="form-input" type="text" name="aeroport" required value="<?=htmlspecialchars($filterAeroport)?>" readonly style="background:#F3F4F6;color:var(--muted);cursor:not-allowed;">
+        </div>
+        <?php else: ?>
         <div class="form-group full"><label class="form-label">Aéroport *</label><input class="form-input" type="text" name="aeroport" required placeholder="Ex : Tunis-Carthage Terminal A"></div>
+        <?php endif; ?>
         <div class="form-group"><label class="form-label">Référence</label><input class="form-input" type="text" name="reference" placeholder="CC-2025-001"></div>
-        <div class="form-group"><label class="form-label">Type de concession</label><input class="form-input" type="text" name="type_concession" placeholder="Bureau, Comptoir…"></div>
+        <div class="form-group"><label class="form-label">Type de concession</label><input class="form-input" type="text" name="type_concession" placeholder="Bureau, Comptoir, Magasin…"></div>
+        <div class="form-group"><label class="form-label">Bailleur</label><input class="form-input" type="text" name="bailleur" placeholder="<?=$default_bailleur?>" value="<?=$default_bailleur?>"></div>
         <div class="form-group"><label class="form-label">Surface (m²)</label><input class="form-input" type="number" step="0.01" name="surface"></div>
         <div class="form-group"><label class="form-label">Statut</label>
           <select class="form-input" name="statut">
@@ -505,9 +676,20 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
         </div>
         <div class="form-group"><label class="form-label">Date de début</label><input class="form-input" type="date" name="date_debut"></div>
         <div class="form-group"><label class="form-label">Date de fin</label><input class="form-input" type="date" name="date_fin"></div>
-        <div class="form-group"><label class="form-label">Montant annuel (TND)</label><input class="form-input" type="number" step="0.01" name="montant_annuel"></div>
+      </div>
+
+      <div class="modal-section">Financier</div>
+      <div class="form-grid">
+        <div class="form-group"><label class="form-label">Montant annuel HT (TND)</label><input class="form-input" type="number" step="0.01" name="montant_annuel" id="add_montant" oninput="calcTvaPreview('add')"></div>
+        <div class="form-group"><label class="form-label">Taux TVA (%)</label><input class="form-input" type="number" step="0.01" min="0" max="100" name="tva" id="add_tva" placeholder="ex : 19" oninput="calcTvaPreview('add')"><span class="form-hint">Laisser vide si exonéré</span></div>
+        <div class="tva-preview" id="add_tva_preview">
+          <div class="tva-prev-item"><div class="tva-prev-label">HT</div><div class="tva-prev-val" id="add_prev_ht">—</div></div>
+          <div class="tva-prev-item"><div class="tva-prev-label">TVA</div><div class="tva-prev-val" id="add_prev_tva">—</div></div>
+          <div class="tva-prev-item"><div class="tva-prev-label">TTC</div><div class="tva-prev-val" id="add_prev_ttc">—</div></div>
+        </div>
         <div class="form-group"><label class="form-label">Contrat PDF</label><input class="form-input" type="file" name="contrat_concession_pdf" accept=".pdf" style="padding:7px 12px;"></div>
       </div>
+
       <div class="form-actions">
         <button type="button" class="btn btn-ghost" onclick="document.getElementById('addModal').classList.remove('open')">Annuler</button>
         <button type="submit" class="btn btn-primary">
@@ -520,10 +702,12 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);colo
 </div>
 
 <script>
-let currentConc = null;
+const fmtNum = (n, dec=0) => n.toLocaleString('fr-FR', {minimumFractionDigits:dec, maximumFractionDigits:dec});
+const fmtDate = d => { if(!d) return '—'; const p=d.split('-'); return p.length===3 ? p[2]+'/'+p[1]+'/'+p[0] : d; };
+
+function toggleGroup(el){ el.classList.toggle('collapsed'); }
 
 function selectConc(c){
-  currentConc = c;
   document.querySelectorAll('.conc-item').forEach(el=>{
     el.classList.toggle('active', parseInt(el.dataset.id)===parseInt(c.id));
   });
@@ -532,8 +716,9 @@ function selectConc(c){
   panel.style.display='block';
   panel.classList.remove('detail'); void panel.offsetWidth; panel.classList.add('detail');
 
+  // Header
   document.getElementById('dp_aeroport').textContent = c.aeroport||'—';
-  document.getElementById('dp_ref').textContent = c.reference||'';
+  document.getElementById('dp_ref').textContent       = c.reference ? 'Réf. '+c.reference : '';
 
   const badge=document.getElementById('dp_statut_badge');
   const s=(c.statut||'').toLowerCase();
@@ -544,23 +729,46 @@ function selectConc(c){
   else if(s.includes('suspen')) badge.className+='badge-suspendue';
   else                          badge.className+='badge-other';
 
-  document.getElementById('dp_type_concession').textContent = c.type_concession||'—';
-  document.getElementById('dp_surface').textContent         = c.surface ? parseFloat(c.surface).toLocaleString('fr-FR')+' m²' : '—';
-  document.getElementById('dp_reference').textContent       = c.reference||'—';
-  document.getElementById('dp_annuel').textContent          = c.montant_annuel ? parseFloat(c.montant_annuel).toLocaleString('fr-FR',{minimumFractionDigits:0})+' TND' : '—';
-  document.getElementById('dp_debut').textContent           = fmtDate(c.date_debut);
-  document.getElementById('dp_fin').textContent             = fmtDate(c.date_fin);
+  // Bailleur tag in header
+  const bwrap = document.getElementById('dp_bailleur_wrap');
+  if(c.bailleur){
+    bwrap.innerHTML = `<span class="detail-bailleur-tag"><svg width="10" height="10" viewBox="0 0 16 16" fill="none"><path d="M2 14V6l6-4 6 4v8H2z" stroke="white" stroke-width="1.4" stroke-linejoin="round"/></svg>${c.bailleur}</span>`;
+  } else { bwrap.innerHTML=''; }
 
-  // Progress
+  // Infos
+  document.getElementById('dp_type_concession').textContent = c.type_concession||'—';
+  document.getElementById('dp_surface').textContent         = c.surface ? fmtNum(parseFloat(c.surface))+' m²' : '—';
+  document.getElementById('dp_reference').textContent       = c.reference||'—';
+  document.getElementById('dp_bailleur').textContent        = c.bailleur||'—';
+
+  // Dates + progress
+  document.getElementById('dp_debut').textContent = fmtDate(c.date_debut);
+  document.getElementById('dp_fin').textContent   = fmtDate(c.date_fin);
   if(c.date_debut && c.date_fin){
     const start=new Date(c.date_debut),end=new Date(c.date_fin),now=new Date();
     const pct=Math.min(100,Math.max(0,Math.round((now-start)/(end-start)*100)));
     document.getElementById('dp_progress').style.width=pct+'%';
     const rem=Math.round((end-now)/86400000);
-    document.getElementById('dp_progress_txt').textContent=pct+'% écoulé · '+(rem>0?rem+' jours restants':'Contrat expiré');
+    document.getElementById('dp_progress_txt').textContent=pct+'% écoulé · '+(rem>0?rem+' j restants':'Contrat expiré');
   } else {
     document.getElementById('dp_progress').style.width='0%';
     document.getElementById('dp_progress_txt').textContent='Dates non renseignées';
+  }
+
+  // Financier
+  const ht  = parseFloat(c.montant_annuel)||0;
+  const tva = (c.tva !== null && c.tva !== '' && c.tva !== undefined) ? parseFloat(c.tva) : null;
+  document.getElementById('dp_annuel').textContent = ht ? fmtNum(ht,3)+' TND' : '—';
+  if(tva !== null){
+    const tvaAmt = ht * tva / 100;
+    const ttc    = ht + tvaAmt;
+    document.getElementById('dp_tva_rate').textContent   = fmtNum(tva,2)+' %';
+    document.getElementById('dp_tva_amount').textContent = fmtNum(tvaAmt,3)+' TND';
+    document.getElementById('dp_ttc').textContent        = fmtNum(ttc,3)+' TND';
+  } else {
+    document.getElementById('dp_tva_rate').textContent   = 'Exonéré / N/A';
+    document.getElementById('dp_tva_amount').textContent = '—';
+    document.getElementById('dp_ttc').textContent        = ht ? fmtNum(ht,3)+' TND (= HT)' : '—';
   }
 
   // PDF
@@ -569,10 +777,22 @@ function selectConc(c){
   docsEl.innerHTML=''; formsEl.innerHTML='';
   const pf='contrat_concession_pdf';
   const fname=c[pf]?c[pf].split('/').pop():null;
-  const safe=(c.aeroport||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+  const safeAp=(c.aeroport||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'");
   const form=document.createElement('form');
   form.method='post';form.enctype='multipart/form-data';form.style.display='none';
-  form.innerHTML=`<input type="hidden" name="action" value="edit"><input type="hidden" name="id" value="${c.id}"><input type="hidden" name="aeroport" value="${(c.aeroport||'').replace(/"/g,'&quot;')}"><input type="hidden" name="reference" value="${(c.reference||'').replace(/"/g,'&quot;')}"><input type="hidden" name="type_concession" value="${(c.type_concession||'').replace(/"/g,'&quot;')}"><input type="hidden" name="surface" value="${c.surface||''}"><input type="hidden" name="date_debut" value="${c.date_debut||''}"><input type="hidden" name="date_fin" value="${c.date_fin||''}"><input type="hidden" name="montant_annuel" value="${c.montant_annuel||''}"><input type="hidden" name="statut" value="${c.statut||'Active'}"><input type="file" name="${pf}" id="inp_${c.id}_${pf}" accept=".pdf" onchange="this.closest('form').submit()">`;
+  form.innerHTML=`<input type="hidden" name="action" value="edit">
+    <input type="hidden" name="id" value="${c.id}">
+    <input type="hidden" name="aeroport" value="${(c.aeroport||'').replace(/"/g,'&quot;')}">
+    <input type="hidden" name="reference" value="${(c.reference||'').replace(/"/g,'&quot;')}">
+    <input type="hidden" name="type_concession" value="${(c.type_concession||'').replace(/"/g,'&quot;')}">
+    <input type="hidden" name="surface" value="${c.surface||''}">
+    <input type="hidden" name="date_debut" value="${c.date_debut||''}">
+    <input type="hidden" name="date_fin" value="${c.date_fin||''}">
+    <input type="hidden" name="montant_annuel" value="${c.montant_annuel||''}">
+    <input type="hidden" name="statut" value="${c.statut||'Active'}">
+    <input type="hidden" name="tva" value="${c.tva??''}">
+    <input type="hidden" name="bailleur" value="${(c.bailleur||'').replace(/"/g,'&quot;')}">
+    <input type="file" name="${pf}" id="inp_${c.id}_${pf}" accept=".pdf" onchange="this.closest('form').submit()">`;
   formsEl.appendChild(form);
   const card=document.createElement('div');
   if(fname){
@@ -580,7 +800,7 @@ function selectConc(c){
     card.innerHTML=`<div class="pdf-doc-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8L14 2z" fill="white" opacity=".9"/><polyline points="14 2 14 8 20 8" stroke="white" stroke-width="1.5" fill="none"/></svg></div>
       <div class="pdf-doc-info"><div class="pdf-doc-title">Contrat</div><div class="pdf-doc-name">${fname}</div></div>
       <div class="pdf-doc-actions">
-        <button class="pdf-doc-btn" onclick="openPDF('${c[pf]}','Contrat — ${safe}')"><svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M1 8s3-5 7-5 7 5 7 5-3 5-7 5-7-5-7-5z" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3"/></svg> Aperçu</button>
+        <button class="pdf-doc-btn" onclick="openPDF('${c[pf]}','Contrat — ${safeAp}')"><svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M1 8s3-5 7-5 7 5 7 5-3 5-7 5-7-5-7-5z" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3"/></svg> Aperçu</button>
         <a class="pdf-doc-btn" href="${c[pf]}" download><svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M8 2v8M5 7l3 3 3-3M3 13h10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg> Télécharger</a>
         <label class="pdf-doc-btn pdf-doc-btn-replace" for="inp_${c.id}_${pf}" style="cursor:pointer;"><svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M8 12V4M5 7l3-3 3 3M3 13h10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg> Remplacer</label>
       </div>`;
@@ -592,33 +812,62 @@ function selectConc(c){
   }
   docsEl.appendChild(card);
 
-  document.getElementById('dp_edit_btn').onclick = ()=>openEdit(c);
-  document.getElementById('dp_del_btn').onclick  = ()=>document.getElementById('deleteModal').classList.add('open');
+  const dpEditBtn = document.getElementById('dp_edit_btn');
+  const dpDelBtn  = document.getElementById('dp_del_btn');
+  if(dpEditBtn) dpEditBtn.onclick = ()=>openEdit(c);
+  if(dpDelBtn)  dpDelBtn.onclick  = ()=>document.getElementById('deleteModal').classList.add('open');
   document.getElementById('contentArea').scrollTop=0;
 }
 
 function openEdit(c){
-  document.getElementById('editSub').textContent          = c.aeroport||'';
-  document.getElementById('edit_id').value                = c.id||'';
-  document.getElementById('edit_aeroport').value          = c.aeroport||'';
-  document.getElementById('edit_reference').value         = c.reference||'';
-  document.getElementById('edit_type_concession').value   = c.type_concession||'';
-  document.getElementById('edit_surface').value           = c.surface||'';
-  document.getElementById('edit_statut').value            = c.statut||'Active';
-  document.getElementById('edit_date_debut').value        = c.date_debut||'';
-  document.getElementById('edit_date_fin').value          = c.date_fin||'';
-  document.getElementById('edit_montant_annuel').value    = c.montant_annuel||'';
+  document.getElementById('editSub').textContent           = c.aeroport||'';
+  document.getElementById('edit_id').value                 = c.id||'';
+  document.getElementById('edit_aeroport').value           = c.aeroport||'';
+  document.getElementById('edit_reference').value          = c.reference||'';
+  document.getElementById('edit_type_concession').value    = c.type_concession||'';
+  document.getElementById('edit_bailleur').value           = c.bailleur||'';
+  document.getElementById('edit_surface').value            = c.surface||'';
+  document.getElementById('edit_statut').value             = c.statut||'Active';
+  document.getElementById('edit_date_debut').value         = c.date_debut||'';
+  document.getElementById('edit_date_fin').value           = c.date_fin||'';
+  document.getElementById('edit_montant_annuel').value     = c.montant_annuel||'';
+  document.getElementById('edit_tva').value                = (c.tva !== null && c.tva !== undefined) ? c.tva : '';
+  calcTvaPreview('edit');
   document.getElementById('editModal').classList.add('open');
 }
 
-function filterSidebar(q){
-  const lq=q.toLowerCase();
-  document.querySelectorAll('.conc-item').forEach(el=>{
-    el.style.display=el.dataset.search.includes(lq)?'':'none';
-  });
+function calcTvaPreview(prefix){
+  const ht  = parseFloat(document.getElementById(prefix==='add'?'add_montant':'edit_montant_annuel').value)||0;
+  const tva = parseFloat(document.getElementById(prefix+'_tva').value)||0;
+  const prev = document.getElementById(prefix+'_tva_preview');
+  if(ht && tva){
+    const tvaAmt=ht*tva/100, ttc=ht+tvaAmt;
+    prev.classList.add('visible');
+    document.getElementById(prefix+'_prev_ht').textContent  = fmtNum(ht,3)+' TND';
+    document.getElementById(prefix+'_prev_tva').textContent = fmtNum(tvaAmt,3)+' TND';
+    document.getElementById(prefix+'_prev_ttc').textContent = fmtNum(ttc,3)+' TND';
+  } else { prev.classList.remove('visible'); }
 }
 
-function fmtDate(d){if(!d)return'—';const p=d.split('-');return p.length===3?p[2]+'/'+p[1]+'/'+p[0]:d;}
+function filterSidebar(q){
+  const lq = q.toLowerCase().trim();
+  document.querySelectorAll('.airport-group').forEach(group=>{
+    let anyVisible = false;
+    group.querySelectorAll('.conc-item').forEach(el=>{
+      const match = !lq || el.dataset.search.includes(lq);
+      el.style.display = match ? '' : 'none';
+      if(match) anyVisible = true;
+    });
+    // Also match airport name itself
+    const apName = (group.dataset.airport||'').toLowerCase();
+    if(!lq || apName.includes(lq)){
+      group.querySelectorAll('.conc-item').forEach(el=>el.style.display='');
+      anyVisible = true;
+    }
+    group.style.display = anyVisible ? '' : 'none';
+    if(lq && anyVisible) group.classList.remove('collapsed');
+  });
+}
 
 function openPDF(url,title){
   document.getElementById('pdfFrame').src=url;
